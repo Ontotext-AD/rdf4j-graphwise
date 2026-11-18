@@ -13,6 +13,8 @@ package org.eclipse.rdf4j.query.algebra.evaluation.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -26,6 +28,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.eclipse.rdf4j.model.Value;
 import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.MutableBindingSet;
@@ -80,6 +83,127 @@ class PreparedValuesSnapshotTest {
 			snapshot.forEach(ordinary::addBinding);
 			assertSame(GraphFrameBindings.EMPTY, GraphFrameBindings.from(BindingSetSnapshots.copyOf(ordinary)));
 			assertSame(ordinary, BindingSetSnapshots.preserveMetadata(new MapBindingSet(), ordinary));
+		}
+	}
+
+	@Test
+	void explicitNullDomainAndUndefSlotStayDistinctAcrossSnapshots() {
+		QueryBindingSet explicitNull = new QueryBindingSet();
+		explicitNull.setBinding("x", null);
+		BindingSet undef = new ListBindingSet(List.of("x"), Arrays.asList((Value) null));
+
+		BindingSet capturedExplicitNull = BindingSetSnapshots.copyOf(explicitNull);
+		BindingSet capturedUndef = BindingSetSnapshots.copyOf(undef);
+
+		assertEquals(Set.of("x"), capturedExplicitNull.getBindingNames());
+		assertTrue(capturedExplicitNull.hasBinding("x"));
+		assertEquals(1, capturedExplicitNull.size());
+		assertFalse(capturedExplicitNull.isEmpty());
+		assertEquals(Set.of("x"), capturedUndef.getBindingNames());
+		assertFalse(capturedUndef.hasBinding("x"));
+		assertEquals(0, capturedUndef.size());
+		assertTrue(capturedUndef.isEmpty());
+		assertNotEquals(capturedExplicitNull, capturedUndef);
+		assertNotEquals(capturedUndef, capturedExplicitNull);
+	}
+
+	@Test
+	void explicitNullSnapshotsRemainEqualAfterSourceMutation() {
+		QueryBindingSet source = new QueryBindingSet();
+		source.setBinding("scoped", null);
+		BindingSet snapshot = BindingSetSnapshots.copyOf(source);
+		QueryBindingSet same = new QueryBindingSet();
+		same.setBinding("scoped", null);
+		BindingSet otherSnapshot = BindingSetSnapshots.copyOf(same);
+		source.setBinding("scoped", SimpleValueFactory.getInstance().createLiteral("changed"));
+
+		assertEquals(Set.of("scoped"), snapshot.getBindingNames());
+		assertTrue(snapshot.hasBinding("scoped"));
+		assertNull(snapshot.getBinding("scoped"));
+		assertNull(snapshot.getValue("scoped"));
+		assertEquals(1, snapshot.size());
+		assertEquals(otherSnapshot, snapshot);
+		assertEquals(snapshot, otherSnapshot);
+		assertEquals(same, snapshot);
+		assertEquals(snapshot, same);
+		assertEquals(same.hashCode(), snapshot.hashCode());
+		QueryBindingSet differentScope = new QueryBindingSet();
+		differentScope.setBinding("other", null);
+		BindingSet differentSnapshot = BindingSetSnapshots.copyOf(differentScope);
+		assertNotEquals(snapshot, differentSnapshot);
+		assertNotEquals(differentSnapshot, snapshot);
+	}
+
+	@Test
+	void mutableCopiesKeepExplicitNullButDoNotBindUndef() {
+		Value value = SimpleValueFactory.getInstance().createLiteral("value");
+		QueryBindingSet source = new QueryBindingSet();
+		source.setBinding("scoped", null);
+		source.setBinding("bound", value);
+		BindingSet scopedSnapshot = BindingSetSnapshots.copyOf(source);
+		BindingSet undefSnapshot = BindingSetSnapshots
+				.copyOf(new ListBindingSet(List.of("undef", "bound"), Arrays.asList(null, value)));
+
+		QueryBindingSet copiedScope = new QueryBindingSet(scopedSnapshot);
+		assertTrue(copiedScope.hasBinding("scoped"));
+		assertNull(copiedScope.getValue("scoped"));
+		assertEquals(2, copiedScope.size());
+		assertEquals(value, copiedScope.getValue("bound"));
+
+		QueryBindingSet addedScope = new QueryBindingSet();
+		addedScope.addAll(scopedSnapshot);
+		assertEquals(copiedScope, addedScope);
+
+		QueryBindingSet copiedUndef = new QueryBindingSet(undefSnapshot);
+		assertFalse(copiedUndef.hasBinding("undef"));
+		assertEquals(1, copiedUndef.size());
+		assertEquals(value, copiedUndef.getValue("bound"));
+
+		Value graph = SimpleValueFactory.getInstance().createIRI("urn:graph");
+		MutableBindingSet withGraph = GraphFrameBindings.supply(new QueryBindingSet(), "graph", graph);
+		withGraph.setBinding("scoped", null);
+		BindingSet graphSnapshot = BindingSetSnapshots.copyOf(withGraph);
+		QueryBindingSet copiedWithGraph = new QueryBindingSet(graphSnapshot);
+		assertTrue(copiedWithGraph.hasBinding("scoped"));
+		assertNull(copiedWithGraph.getValue("scoped"));
+		assertTrue(GraphFrameBindings.isSupplied(copiedWithGraph, "graph"));
+		assertEquals(graphSnapshot, copiedWithGraph);
+		assertEquals(copiedWithGraph, graphSnapshot);
+	}
+
+	@Test
+	void oneShotValuesKeepNullScopeDistinctFromUndef() {
+		Value value = SimpleValueFactory.getInstance().createLiteral("bound");
+		QueryBindingSet explicitNull = new QueryBindingSet();
+		explicitNull.setBinding("scoped", null);
+		explicitNull.setBinding("bound", value);
+		BindingSet undef = new ListBindingSet(List.of("undef", "bound"), Arrays.asList(null, value));
+		AtomicInteger traversals = new AtomicInteger();
+		BindingSetAssignment assignment = assignment(() -> {
+			if (traversals.incrementAndGet() != 1) {
+				throw new IllegalStateException("VALUES iterable may be traversed only once");
+			}
+			return List.of((BindingSet) explicitNull, undef).iterator();
+		});
+		QueryRoot root = new QueryRoot(assignment);
+		QueryEvaluationStep prepared = strategy().precompile(root);
+		BindingSetAssignment captured = (BindingSetAssignment) root.getArg();
+		Iterator<BindingSet> rows = captured.getBindingSets().iterator();
+		BindingSet capturedExplicitNull = rows.next();
+		BindingSet capturedUndef = rows.next();
+
+		assertTrue(capturedExplicitNull.hasBinding("scoped"));
+		assertFalse(capturedUndef.hasBinding("undef"));
+		assertEquals(Set.of("scoped", "undef", "bound"), captured.getBindingNames());
+		assertEquals(Set.of("bound"), captured.getPossibleBindingNames());
+		assertEquals(Set.of("bound"), captured.getAssuredBindingNames());
+		assertEquals(1, traversals.get());
+		List<BindingSet> results = evaluate(prepared);
+		assertEquals(2, results.size());
+		for (BindingSet result : results) {
+			assertFalse(result.hasBinding("scoped"));
+			assertFalse(result.hasBinding("undef"));
+			assertEquals(value, result.getValue("bound"));
 		}
 	}
 

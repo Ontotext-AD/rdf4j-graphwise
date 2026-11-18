@@ -52,10 +52,18 @@ public final class BindingSetSnapshots {
 		}
 		List<String> names = new ArrayList<>(bindings.getBindingNames());
 		List<Value> values = new ArrayList<>(names.size());
+		Set<String> boundNames = null;
 		for (String name : names) {
 			values.add(bindings.getValue(name));
+			// A possible name can be UNDEF, while an explicit-null binding still belongs to the source domain.
+			if (!bindings.hasBinding(name)) {
+				if (boundNames == null) {
+					boundNames = new LinkedHashSet<>(names);
+				}
+				boundNames.remove(name);
+			}
 		}
-		return preserveMetadata(bindings, new ValueSnapshot(names, values));
+		return preserveMetadata(bindings, new ValueSnapshot(names, values, boundNames, bindings.size()));
 	}
 
 	/**
@@ -74,15 +82,29 @@ public final class BindingSetSnapshots {
 	private static final class ValueSnapshot extends ListBindingSet implements Snapshot {
 		private static final long serialVersionUID = 1L;
 		private final Set<String> names;
+		private final Set<String> boundNames;
+		private final int size;
 
-		private ValueSnapshot(List<String> names, List<Value> values) {
+		private ValueSnapshot(List<String> names, List<Value> values, Set<String> boundNames, int size) {
 			super(Collections.unmodifiableList(names), Collections.unmodifiableList(values));
 			this.names = Collections.unmodifiableSet(new LinkedHashSet<>(names));
+			this.boundNames = boundNames == null ? this.names : Collections.unmodifiableSet(boundNames);
+			this.size = size;
 		}
 
 		@Override
 		public Set<String> getBindingNames() {
 			return names;
+		}
+
+		@Override
+		public boolean hasBinding(String bindingName) {
+			return boundNames.contains(bindingName);
+		}
+
+		@Override
+		public int size() {
+			return size;
 		}
 	}
 }
