@@ -460,6 +460,14 @@ public class RepositoryFederatedService implements FederatedService {
 		return true;
 	}
 
+	@Override
+	public boolean validatesRuntimeBindingTransport() {
+		// These implementations use the transport checks below. Existing subclasses can override the
+		// evaluation hooks and keep receiving validated inputs unless they opt into taking responsibility.
+		Class<?> implementation = getClass();
+		return implementation == RepositoryFederatedService.class || implementation == SPARQLFederatedService.class;
+	}
+
 	private static BindingSet relevantBindings(Service service, BindingSet outgoing) {
 		MapBindingSet relevant = new MapBindingSet();
 		Set<String> names = FederatedServiceIdentity.relevantBindingNames(service);
@@ -564,6 +572,7 @@ public class RepositoryFederatedService implements FederatedService {
 		BindingSet parameterIdentities = EmptyBindingSet.getInstance();
 		boolean valuesTransportAttempted = false;
 		try (var active = allocation.activate()) {
+			boolean fixedEndpoint = service.getServiceRef().hasValue() && !service.getServiceRef().hasApiInputOrigin();
 			Service logical = withResolvedSelector(service, originals);
 			SPARQLQueries.ServiceRequest request = SPARQLQueries.prepareServiceRequest(logical, List.of(),
 					bnodeIdentityScope, blankNodeReferencesSupported, canonicalBNodeIDsSupported);
@@ -572,13 +581,23 @@ public class RepositoryFederatedService implements FederatedService {
 			SPARQLQueries.initializeServiceReferences(service);
 			Map<String, Value> independentFixed = provenIndependentFixedOutputs(logical, service, originals);
 			List<BindingSet> queryInputs = new ArrayList<>(originals.size());
-			List<BindingSet> transported = new ArrayList<>(originals.size());
 			boolean inputOmitted = false;
 			for (BindingSet original : originals) {
 				TransportInput input = omitIndependentFixedOutputs(original, independentFixed);
 				inputOmitted |= !input.omitted().isEmpty();
 				queryInputs.add(input.bindings());
-				transported.add(request.prepareRuntimeInput(input.bindings()));
+			}
+			if (fixedEndpoint) {
+				var independentOutputs = SPARQLQueries.independentExistsOutputNames(service, queryInputs,
+						request.nativeParameters());
+				if (independentOutputs.isPresent()) {
+					return evaluateOnceAndJoinLocally(service, originals, baseUri, parameterIdentities, null,
+							EmptyBindingSet.getInstance(), independentOutputs.get());
+				}
+			}
+			List<BindingSet> transported = new ArrayList<>(queryInputs.size());
+			for (BindingSet input : queryInputs) {
+				transported.add(request.prepareRuntimeInput(input));
 			}
 			// Preserve one logical invocation and subquery input scope, after validating every outgoing identity.
 			int singleRequestLimit = boundJoinBlockSize > 0 ? boundJoinBlockSize : Integer.MAX_VALUE;

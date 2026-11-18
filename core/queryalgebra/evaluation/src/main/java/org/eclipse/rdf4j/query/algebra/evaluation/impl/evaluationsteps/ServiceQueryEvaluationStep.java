@@ -16,12 +16,15 @@ package org.eclipse.rdf4j.query.algebra.evaluation.impl.evaluationsteps;
 import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.common.iteration.CloseableIteratorIteration;
 import org.eclipse.rdf4j.common.iteration.ConvertingIteration;
+import org.eclipse.rdf4j.common.iteration.CooperativeCancellation;
 import org.eclipse.rdf4j.common.iteration.Iterations;
+import org.eclipse.rdf4j.common.iteration.LookAheadIteration;
 import org.eclipse.rdf4j.common.iteration.SingletonIteration;
 import org.eclipse.rdf4j.http.client.QueryExecutionContext;
 import org.eclipse.rdf4j.model.IRI;
@@ -31,6 +34,7 @@ import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
 import org.eclipse.rdf4j.query.Binding;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
+import org.eclipse.rdf4j.query.QueryResults;
 import org.eclipse.rdf4j.query.algebra.Service;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.Var;
@@ -43,7 +47,9 @@ import org.eclipse.rdf4j.query.algebra.evaluation.impl.QueryEvaluationContext;
 import org.eclipse.rdf4j.query.algebra.evaluation.util.ExternalValuePreparation;
 import org.eclipse.rdf4j.query.algebra.helpers.QueryAlgebraBindingAnalysis;
 import org.eclipse.rdf4j.query.explanation.TelemetryMetricNames;
+import org.eclipse.rdf4j.query.impl.BindingSetSnapshots;
 import org.eclipse.rdf4j.query.impl.BlankNodeAllocationScope;
+import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
 import org.eclipse.rdf4j.query.impl.RemoteBNode;
 import org.eclipse.rdf4j.query.parser.sparql.SPARQLQueries;
 
@@ -107,15 +113,22 @@ public final class ServiceQueryEvaluationStep implements QueryEvaluationStep {
 			}
 
 			SPARQLQueries.ServiceRequest request = SPARQLQueries.prepareServiceRequest(service,
-					List.of(invocationBindings), receivingScope, referenceSupport, canonicalIDs);
+					List.of(), receivingScope, referenceSupport, canonicalIDs);
 			Service requestService = request.service();
 
-			// create a copy of the free variables, and remove those for which
-			// bindings are available (we can set them as constraints!)
-			Set<String> freeVars = new HashSet<>(visibleNames);
-			freeVars.removeAll(invocationBindings.getBindingNames());
-
-			bindings = request.prepareRuntimeInput(invocationBindings);
+			Optional<Set<String>> independentOutputs = serviceRef.hasValue() && !serviceRef.hasApiInputOrigin()
+					? SPARQLQueries.independentExistsOutputNames(requestService, List.of(invocationBindings),
+							request.nativeParameters())
+					: Optional.empty();
+			boolean independent = independentOutputs.isPresent();
+			Set<String> freeVars = new HashSet<>(independentOutputs.orElse(visibleNames));
+			if (independent) {
+				// Shared output names must remain available for the compatibility join.
+				bindings = EmptyBindingSet.getInstance();
+			} else {
+				freeVars.removeAll(invocationBindings.getBindingNames());
+				bindings = request.prepareRuntimeInput(invocationBindings);
+			}
 			if (runtimeTelemetryEnabled) {
 				addLongMetric(service, TelemetryMetricNames.REMOTE_BYTES_SENT_ACTUAL,
 						estimateRequestBytes(service, bindings, freeVars));
@@ -173,6 +186,9 @@ public final class ServiceQueryEvaluationStep implements QueryEvaluationStep {
 						return response.map(row, invocationBindings);
 					}
 				};
+				if (independent) {
+					results = joinIndependentResults(results, invocationBindings);
+				}
 				CloseableIteration<BindingSet> checked = ExternalValuePreparation.checkReplayAfterCalls(results);
 				if (service.isSilent()) {
 					results = null;
@@ -207,6 +223,39 @@ public final class ServiceQueryEvaluationStep implements QueryEvaluationStep {
 				recordRequestLatency(service, started);
 			}
 		}
+	}
+
+	private static CloseableIteration<BindingSet> joinIndependentResults(CloseableIteration<BindingSet> remote,
+			BindingSet input) {
+		return new LookAheadIteration<>() {
+			@Override
+			protected BindingSet getNextElement() {
+				while (remote.hasNext()) {
+					BindingSet row = remote.next();
+					if (QueryResults.bindingSetsCompatible(input, row)) {
+						QueryBindingSet merged = new QueryBindingSet(input);
+						for (Binding binding : row) {
+							if (binding.getValue() != null && merged.getValue(binding.getName()) == null) {
+								merged.setBinding(binding);
+							}
+						}
+						return BindingSetSnapshots.preserveMetadata(input,
+								BindingSetSnapshots.preserveMetadata(row, merged));
+					}
+				}
+				return null;
+			}
+
+			@Override
+			protected void handleClose() {
+				remote.close();
+			}
+
+			@Override
+			protected boolean forwardCancellation() {
+				return CooperativeCancellation.forward(remote);
+			}
+		};
 	}
 
 	private static BindingSet restoreRuntimeBindings(BindingSet originals, BindingSet runtimeInputs) {

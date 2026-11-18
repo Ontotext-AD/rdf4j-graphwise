@@ -68,6 +68,7 @@ public class Service extends UnaryTupleOperator {
 	private PreparedBindingRequest preparedBindingRequest;
 	private volatile RuntimeBindingHistory runtimeBindingHistory = EMPTY_HISTORY;
 	private volatile SavedBindingNames savedBindingNames;
+	private transient volatile ExistsScopeFacts existsScopeFacts;
 	private Set<String> bnodeReferenceVarNames = Set.of();
 	private Set<String> reservedBNodeIDs = Set.of();
 	private boolean containedBNodeReferenceSyntax;
@@ -189,10 +190,12 @@ public class Service extends UnaryTupleOperator {
 				runtimeBindingHistory.savedQuery() == null ? savedQuery : runtimeBindingHistory.savedQuery());
 	}
 
-	private record SavedBindingNames(Set<String> all, Set<String> possibleReads) implements Serializable {
+	private record SavedBindingNames(Set<String> all, Set<String> possibleReads, Set<String> existsNames)
+			implements Serializable {
 		private SavedBindingNames {
 			all = Set.copyOf(all);
 			possibleReads = Set.copyOf(possibleReads);
+			existsNames = existsNames == null ? null : Set.copyOf(existsNames);
 		}
 	}
 
@@ -217,7 +220,38 @@ public class Service extends UnaryTupleOperator {
 
 	@InternalUseOnly
 	public void setSavedBindingNames(Set<String> names, Set<String> possibleReads) {
-		savedBindingNames = new SavedBindingNames(names, possibleReads);
+		setSavedBindingNames(names, possibleReads, null);
+	}
+
+	@InternalUseOnly
+	public void setSavedBindingNames(Set<String> names, Set<String> possibleReads, Set<String> existsNames) {
+		savedBindingNames = new SavedBindingNames(names, possibleReads, existsNames);
+	}
+
+	/** Names mentioned inside EXISTS scopes in the saved text, or null if the syntax has not been inspected. */
+	@InternalUseOnly
+	public Set<String> getSavedExistsBindingNames() {
+		SavedBindingNames names = savedBindingNames;
+		return names == null ? null : names.existsNames();
+	}
+
+	/** Binding facts from the executable saved source, without input rows from the surrounding query. */
+	@InternalUseOnly
+	public record ExistsScopeFacts(Set<String> observedInputNames, Set<String> outputNames) {
+		public ExistsScopeFacts {
+			observedInputNames = Set.copyOf(observedInputNames);
+			outputNames = Set.copyOf(outputNames);
+		}
+	}
+
+	@InternalUseOnly
+	public ExistsScopeFacts getExistsScopeFacts() {
+		return existsScopeFacts;
+	}
+
+	@InternalUseOnly
+	public void setExistsScopeFacts(ExistsScopeFacts facts) {
+		existsScopeFacts = facts;
 	}
 
 	/** Constant variable names originating from references owned by this SERVICE, excluding nested SERVICEs. */
@@ -276,6 +310,7 @@ public class Service extends UnaryTupleOperator {
 		preparedAskQueryString = null;
 		preparedSelectQueryString = null;
 		savedBindingNames = null;
+		existsScopeFacts = null;
 		invalidateReferenceMetadata();
 	}
 
@@ -474,6 +509,7 @@ public class Service extends UnaryTupleOperator {
 		if (preparedAskQueryString == null || !Objects.equals(preparedPrefixes, prefixDeclarations)) {
 			invalidateReferenceMetadata();
 			savedBindingNames = null;
+			existsScopeFacts = null;
 			initPreparedQueryString();
 		}
 	}

@@ -17,11 +17,16 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.eclipse.rdf4j.common.iteration.CloseableIteration;
+import org.eclipse.rdf4j.common.iteration.EmptyIteration;
+import org.eclipse.rdf4j.common.iteration.Iterations;
+import org.eclipse.rdf4j.model.BNode;
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.Value;
 import org.eclipse.rdf4j.model.ValueFactory;
@@ -32,8 +37,12 @@ import org.eclipse.rdf4j.query.QueryLanguage;
 import org.eclipse.rdf4j.query.QueryResults;
 import org.eclipse.rdf4j.query.TupleQuery;
 import org.eclipse.rdf4j.query.TupleQueryResult;
+import org.eclipse.rdf4j.query.algebra.Service;
 import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedService;
 import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedServiceResolver;
+import org.eclipse.rdf4j.query.algebra.helpers.AbstractQueryModelVisitor;
+import org.eclipse.rdf4j.query.impl.MapBindingSet;
+import org.eclipse.rdf4j.query.parser.QueryParserUtil;
 import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.base.RepositoryConnectionWrapper;
 import org.eclipse.rdf4j.repository.base.RepositoryWrapper;
@@ -42,6 +51,8 @@ import org.eclipse.rdf4j.sail.memory.MemoryStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * SPARQL defines a constant-IRI SERVICE as ONE logical {@code Invocation} producing one result multiset; a failed
@@ -140,7 +151,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 
 	@Test
 	public void nativeMultirowServiceReadsExpressionOnlyCallerBindings() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 
 		List<BindingSet> rows = evaluate("""
@@ -159,7 +170,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 
 	@Test
 	public void nativeMultirowServiceKeepsDuplicatesAndTreatsUndefAsUnbound() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 
 		List<BindingSet> rows = evaluate("""
@@ -176,32 +187,175 @@ public class RepositoryFederatedServiceSemanticsTest {
 		assertEquals(1, nativeRepository.tupleQueries.get());
 	}
 
-	@Test
-	public void nativeMultirowServiceCorrelatesNestedExistsBeyondTheBlockSize() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
-		RepositoryFederatedService service = new RepositoryFederatedService(nativeRepository, false);
-		service.setBoundJoinBlockSize(1);
+	@ParameterizedTest
+	@ValueSource(booleans = { false, true })
+	public void serviceInvocationKeepsNestedExistsIndependentOfTheBlockSize(boolean serialized) {
+		CountingBindingRepository repository = new CountingBindingRepository(serviceRepo, serialized);
+		RepositoryFederatedService service = new RepositoryFederatedService(repository, false);
 		useService(service);
-
-		List<BindingSet> rows = evaluate("""
+		String query = """
 				SELECT ?input ?out WHERE {
 					VALUES ?input { 1 2 }
 					SERVICE <urn:dummy> {
 						VALUES ?out { 1 2 }
-						FILTER EXISTS { FILTER(?out = ?input) }
+						FILTER %s EXISTS { FILTER(?out = ?input) }
 					}
 				}
-				ORDER BY ?input
-				""");
+				ORDER BY ?input ?out
+				""";
 
-		assertEquals(List.of("1", "2"),
-				rows.stream().map(row -> row.getValue("out").stringValue()).toList());
-		assertEquals(1, nativeRepository.tupleQueries.get());
+		for (int blockSize : List.of(1, 2)) {
+			service.setBoundJoinBlockSize(blockSize);
+			String context = "block size=" + blockSize;
+			int before = repository.tupleQueries.get();
+			assertEquals(List.of(), evaluate(query.formatted("")), context);
+			assertEquals(List.of("1", "2", "1", "2"), evaluate(query.formatted("NOT")).stream()
+					.map(row -> row.getValue("out").stringValue())
+					.toList(), context);
+			assertEquals(before + 2, repository.tupleQueries.get(), context);
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = { false, true })
+	public void serviceInOptionalKeepsItsExistsDomainAndProjectsSharedOutputs(boolean serialized) {
+		useService(new RepositoryFederatedService(new CountingBindingRepository(serviceRepo, serialized), false));
+		List<BindingSet> rows = evaluate("""
+				SELECT ?input ?out WHERE {
+					VALUES ?input { 1 2 3 }
+					OPTIONAL {
+						SERVICE <urn:dummy> {
+							VALUES (?input ?out) { (1 1) (2 2) (UNDEF 3) }
+							FILTER EXISTS { FILTER(?out = ?input) }
+						}
+					}
+				}
+				ORDER BY ?input ?out
+				""");
+		assertEquals(3, rows.size());
+		assertEquals("1", rows.get(0).getValue("out").stringValue());
+		assertEquals("2", rows.get(1).getValue("out").stringValue());
+		assertNull(rows.get(2).getValue("out"), "The independent result has no compatible row for input 3");
+	}
+
+	@Test
+	public void serializedSelectKeepsOptionalValuesCompatibleWithIncomingBinding() {
+		CountingBindingRepository repository = new CountingBindingRepository(serviceRepo, true);
+		useService(new RepositoryFederatedService(repository, false));
+		Service service = parsedService("""
+				OPTIONAL { VALUES (?x ?y) { (<urn:other> 1) } }
+				VALUES ?x { <urn:same> }
+				""");
+		MapBindingSet input = new MapBindingSet();
+		input.addBinding("x", vf.createIRI("urn:same"));
+
+		assertEquals(List.of(input), Iterations.asList(federatedService.select(service, Set.of("y"), input, null)));
+		assertEquals(1, repository.tupleQueries.get());
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = { false, true })
+	public void independentExistsKeepsLocalBlankNodesWithinTheCaller(boolean serialized) {
+		CountingBindingRepository repository = new CountingBindingRepository(serviceRepo, serialized);
+		useService(new RepositoryFederatedService(repository, false));
+		String service = """
+				SERVICE <urn:dummy> {
+					VALUES ?out { 1 }
+					FILTER NOT EXISTS { FILTER(BOUND(?input)) }
+				}
+				""";
+		String query = """
+				SELECT ?input ?out WHERE {
+					VALUES ?row { 1 2 }
+					BIND(BNODE() AS ?input)
+					%s
+				}
+				""";
+		for (String pattern : List.of(service, "OPTIONAL { " + service + " }")) {
+			List<BindingSet> rows = evaluate(query.formatted(pattern));
+			assertEquals(2, rows.size());
+			assertEquals(List.of("1", "1"), rows.stream().map(row -> row.getValue("out").stringValue()).toList());
+			assertEquals(2, distinctValues(rows, "input").size());
+			assertTrue(rows.stream().allMatch(row -> row.getValue("input") instanceof BNode));
+		}
+		int before = repository.tupleQueries.get();
+		assertThrows(QueryEvaluationException.class,
+				() -> evaluate(query.formatted("SERVICE <urn:dummy> { ?input <urn:test:p> ?out }")));
+		assertEquals(before, repository.tupleQueries.get(), "An unowned identity cannot reach the repository");
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = { false, true })
+	public void dynamicServiceAndDirectProviderCallsKeepExplicitExistsInputs(boolean serialized) {
+		CountingBindingRepository repository = new CountingBindingRepository(serviceRepo, serialized);
+		useService(new RepositoryFederatedService(repository, false));
+		String body = """
+				VALUES ?out { 1 2 }
+				FILTER EXISTS { FILTER(?out = ?input) }
+				""";
+		List<BindingSet> rows = evaluate("""
+				SELECT ?endpoint ?input WHERE {
+					VALUES (?endpoint ?input) { (<urn:dummy> 1) (<urn:other> 2) }
+					SERVICE ?endpoint { %s }
+				}
+				ORDER BY ?input
+				""".formatted(body));
+		assertEquals(List.of("urn:dummy", "urn:other"),
+				rows.stream().map(row -> row.getValue("endpoint").stringValue()).toList());
+
+		Service service = parsedService(body);
+		MapBindingSet input = new MapBindingSet();
+		input.addBinding("input", rows.getFirst().getValue("input"));
+		assertTrue(federatedService.ask(service, input, null));
+		assertEquals(List.of("1"), Iterations.asList(federatedService.select(service, Set.of("out"), input, null))
+				.stream()
+				.map(row -> row.getValue("out").stringValue())
+				.toList());
+	}
+
+	@Test
+	public void customVectoredServiceStillReceivesValidatedInputs() {
+		AtomicInteger consumed = new AtomicInteger();
+		useService(new RepositoryFederatedService(serviceRepo, false) {
+			@Override
+			public CloseableIteration<BindingSet> evaluate(Service service, CloseableIteration<BindingSet> bindings,
+					String baseUri) {
+				try (bindings) {
+					while (bindings.hasNext()) {
+						bindings.next();
+						consumed.incrementAndGet();
+					}
+				}
+				return new EmptyIteration<>();
+			}
+		});
+		assertThrows(QueryEvaluationException.class, () -> evaluate("""
+				SELECT ?row WHERE {
+					VALUES ?row { 1 2 }
+					BIND(BNODE() AS ?input)
+					SERVICE <urn:dummy> { FILTER EXISTS { FILTER(BOUND(?input)) } }
+				}
+				"""));
+		assertEquals(0, consumed.get());
+	}
+
+	private static Service parsedService(String body) {
+		var queryModel = QueryParserUtil.parseTupleQuery(QueryLanguage.SPARQL, """
+				SELECT * WHERE { SERVICE <urn:dummy> { %s } }
+				""".formatted(body), null).getTupleExpr();
+		List<Service> services = new ArrayList<>();
+		queryModel.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+			@Override
+			public void meet(Service service) {
+				services.add(service);
+			}
+		});
+		return services.getFirst();
 	}
 
 	@Test
 	public void nativeMultirowServiceKeepsSubqueryLocalBindingsIndependent() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 
 		List<BindingSet> rows = evaluate("""
@@ -225,7 +379,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 
 	@Test
 	public void nativeMultirowServiceBindsNullableOutputBeforeFilter() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 
 		String query = """
@@ -249,7 +403,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 
 	@Test
 	public void nativeMultirowServiceKeepsCommonBindingOutsideSubquery() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 
 		List<BindingSet> rows = evaluate("""
@@ -269,7 +423,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 
 	@Test
 	public void nativeMultirowServiceRespectsIndependentUnionFilter() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 		String body = """
 				{ VALUES ?out { 1 } }
@@ -294,7 +448,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 
 	@Test
 	public void nativeSingletonServiceBindsOuterFilterAlongsideSubquery() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 
 		List<BindingSet> rows = evaluate("""
@@ -314,7 +468,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 
 	@Test
 	public void nativeMultirowServicePreservesMinusDomains() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 		String body = "VALUES ?out { 1 2 } FILTER(?out = ?input) MINUS { VALUES ?input { %s } }";
 
@@ -325,7 +479,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 
 	@Test
 	public void nativeMultirowServiceMatchesOuterRelationWithLateral() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 
 		assertNativeServiceMatchesOuterRelation("1 2", """
@@ -338,7 +492,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 
 	@Test
 	public void nativeMultirowServiceMatchesOuterRelationWithNestedService() {
-		NativeBindingRepository nativeRepository = new NativeBindingRepository(serviceRepo);
+		CountingBindingRepository nativeRepository = new CountingBindingRepository(serviceRepo);
 		useService(new RepositoryFederatedService(nativeRepository, false));
 		RepositoryFederatedService leaf = new RepositoryFederatedService(serviceRepo, false);
 		localRepo.setFederatedServiceResolver(endpoint -> "urn:leaf".equals(endpoint) ? leaf : federatedService);
@@ -456,12 +610,18 @@ public class RepositoryFederatedServiceSemanticsTest {
 		return vf.createIRI("urn:test:" + local);
 	}
 
-	private static final class NativeBindingRepository extends RepositoryWrapper {
+	private static final class CountingBindingRepository extends RepositoryWrapper {
 
 		private final AtomicInteger tupleQueries = new AtomicInteger();
+		private final boolean serialized;
 
-		private NativeBindingRepository(SailRepository delegate) {
+		private CountingBindingRepository(SailRepository delegate) {
+			this(delegate, false);
+		}
+
+		private CountingBindingRepository(SailRepository delegate, boolean serialized) {
 			super(delegate);
+			this.serialized = serialized;
 		}
 
 		@Override
@@ -469,7 +629,7 @@ public class RepositoryFederatedServiceSemanticsTest {
 			return new RepositoryConnectionWrapper(this, super.getConnection()) {
 				@Override
 				public boolean supportsSPARQLBindingTransport() {
-					return false;
+					return serialized;
 				}
 
 				@Override

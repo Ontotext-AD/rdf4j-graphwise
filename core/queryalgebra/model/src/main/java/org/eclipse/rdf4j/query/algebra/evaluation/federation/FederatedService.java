@@ -13,6 +13,7 @@ package org.eclipse.rdf4j.query.algebra.evaluation.federation;
 
 import java.util.Set;
 
+import org.eclipse.rdf4j.common.annotation.InternalUseOnly;
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
@@ -49,6 +50,15 @@ public interface FederatedService {
 	 * binding validation remain the caller's responsibility. Unknown providers use scalar SELECT evaluation.
 	 */
 	default boolean preservesBNodeResultProvenance() {
+		return false;
+	}
+
+	/**
+	 * Whether vectored evaluation accepts caller bindings and validates the values it actually transports. Providers
+	 * with this capability can evaluate an independent relation without transporting the caller's local identities.
+	 */
+	@InternalUseOnly
+	default boolean validatesRuntimeBindingTransport() {
 		return false;
 	}
 

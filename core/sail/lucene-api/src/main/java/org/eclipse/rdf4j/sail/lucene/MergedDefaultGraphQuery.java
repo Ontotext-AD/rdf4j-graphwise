@@ -26,6 +26,9 @@ record MergedDefaultGraphQuery(SearchQueryEvaluator query, List<SearchQueryEvalu
 		implements SearchQueryEvaluator {
 
 	Collection<BindingSet> evaluate(SearchIndex index) throws SailException {
+		if (index instanceof AbstractSearchIndex searchIndex) {
+			return searchIndex.evaluateMergedGeometry(this);
+		}
 		HashSet<String> names = new HashSet<>();
 		LinkedHashSet<BindingSet> rows = new LinkedHashSet<>();
 		for (SearchQueryEvaluator lookup : lookups) {

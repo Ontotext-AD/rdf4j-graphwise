@@ -55,10 +55,30 @@ class IncomingBindingReadProofTest {
 		assertProof(new Extension(new SingletonSet(), new ExtensionElem(value(1), "x"),
 				new ExtensionElem(Var.of("x"), "copy")), true);
 		assertProof(new Filter(values(1), new Bound(Var.of("x"))), true);
-		assertProof(project(values(1), new ProjectionElem("x", "copy")), true);
+		assertProof(project(fixedDefinition(), new ProjectionElem("x", "copy")), true);
 		Group group = new Group(values(1));
 		group.addGroupBindingName("x");
 		assertProof(group, true);
+	}
+
+	@Test
+	void rejectsCompatibilityReadsByValuesInOptionalAndUnion() {
+		BindingSetAssignment opaque = new BindingSetAssignment();
+		opaque.setBindingSets(() -> {
+			throw new AssertionError("The proof must leave an opaque row source untouched");
+		});
+		assertAll(
+				() -> assertProof(values(1), true),
+				() -> assertProof(new Union(values(1), values(1)), true),
+				() -> assertProof(new Join(new LeftJoin(new SingletonSet(), values(2)), values(1)), false),
+				() -> assertProof(new Union(new LeftJoin(new SingletonSet(), values(2)), values(1)), false),
+				() -> assertProof(new LeftJoin(new SingletonSet(), nullableValues("x", null, 2)), false),
+				() -> assertProof(new LeftJoin(new SingletonSet(), nullableValues("x", (Integer) null)), true),
+				() -> assertProof(new Extension(
+						new LeftJoin(new SingletonSet(), new Filter(values(2), new Bound(Var.of("x")))),
+						new ExtensionElem(value(1), "x")), false),
+				() -> assertProof(opaque, false),
+				() -> assertProof(new Join(fixedDefinition(), values(1)), true));
 	}
 
 	@Test
@@ -357,6 +377,10 @@ class IncomingBindingReadProofTest {
 
 	private static Projection project(TupleExpr argument, ProjectionElem element) {
 		return new Projection(argument, new ProjectionElemList(element));
+	}
+
+	private static Extension fixedDefinition() {
+		return new Extension(new SingletonSet(), new ExtensionElem(value(1), "x"));
 	}
 
 	private static BindingSetAssignment values(int value) {

@@ -149,11 +149,12 @@ public class ServiceJoinIterator extends JoinExecutorBase<BindingSet> {
 				if (response != null) {
 					response.seedOriginalBindings(request.parameterIdentities());
 				}
+				boolean validatesTransport = fs.validatesRuntimeBindingTransport();
 				CloseableIteration<BindingSet> checkedInputs = new ConvertingIteration<>(leftIter) {
 					@Override
 					protected BindingSet convert(BindingSet input) {
-						return request
-								.prepareRuntimeInput(response == null ? input : response.markCallerAliases(input));
+						BindingSet caller = response == null ? input : response.markCallerAliases(input);
+						return validatesTransport ? caller : request.prepareRuntimeInput(caller);
 					}
 				};
 				CloseableIteration<BindingSet> externalBindings = ExternalValuePreparation

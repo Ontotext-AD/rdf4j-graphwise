@@ -275,9 +275,9 @@ public final class QueryAlgebraBindingAnalysis {
 	}
 
 	/**
-	 * Sufficient proof that execution cannot observe one incoming RDF value. The seed is guaranteed but unknown: no
-	 * actual or prepared value may establish the local fixed facts used by this proof. A false result means that
-	 * independence is unproven, not that the value is necessarily read.
+	 * Sufficient proof that execution cannot observe one incoming RDF value except through compatibility with a
+	 * guaranteed fixed result binding. The seed is guaranteed but unknown: no actual or prepared value may establish
+	 * the local fixed facts used by this proof. A false result means that independence is unproven.
 	 */
 	public static boolean provesUnusedIncomingValue(TupleExpr body, String name) {
 		Objects.requireNonNull(body, "body");
@@ -313,6 +313,18 @@ public final class QueryAlgebraBindingAnalysis {
 			if (node instanceof Var variable && name.equals(variable.getName()) && !variable.hasValue()
 					&& !readHasNoIncomingValue(input, name)) {
 				independent[0] = false;
+			} else if (node instanceof BindingSetAssignment assignment && input.maybeBoundNames().contains(name)
+					&& !readHasNoIncomingValue(input, name)) {
+				// VALUES compares its bound entries with the incoming mapping before producing each row.
+				independent[0] = assignment.hasRepeatableBindingSets()
+						&& (!assignment.getPossibleBindingNames().contains(name)
+								|| analysis.canDeferAssignmentCompatibility(assignment, input, name));
+			} else if (node instanceof LeftJoin optional && input.maybeBoundNames().contains(name)
+					&& !readHasNoIncomingValue(input, name)
+					&& !analysis.leftJoinInput(optional, input).maybeBoundNames().contains(name)) {
+				// A withheld input can still reject an OPTIONAL result when the evaluator restores that input.
+				OutputFacts output = analysis.outputFacts(optional, input);
+				independent[0] = output.possibleOutputsKnown() && !output.possibleOutputs().contains(name);
 			} else if (node instanceof Group group && group.getGroupBindingNames().contains(name)) {
 				ReadOnlyContext argumentInput = analysis.childInput(group, group.getArg(), input);
 				ReadOnlyContext rows = analysis.withOutput(argumentInput,
@@ -330,6 +342,37 @@ public final class QueryAlgebraBindingAnalysis {
 			return independent[0];
 		});
 		return independent[0];
+	}
+
+	private boolean canDeferAssignmentCompatibility(BindingSetAssignment assignment, ReadOnlyContext input,
+			String name) {
+		Value assigned = outputFacts(assignment, input).fixedValues().get(name);
+		if (assigned == null) {
+			return false;
+		}
+		// With a compatible incoming value the mandatory VALUES cannot discard any rows. If it is
+		// incompatible, the final compatibility check can discard the same result branch.
+		OutputFacts result = outputFacts(root, rootContext.without(Set.of(name)));
+		if (!result.guaranteedOutputsKnown() || !assigned.equals(result.fixedValues().get(name))) {
+			return false;
+		}
+		for (QueryModelNode node = assignment; node != root; node = node.getParentNode()) {
+			boolean forwardsRows = switch (node.getParentNode()) {
+			case Join _,Union _,Lateral _,Filter _,Extension _,Order _,Slice _,QueryRoot _ -> true;
+			case LeftJoin optional -> optional.getLeftArg() == node;
+			case Group group -> group.getGroupBindingNames().contains(name);
+			case Projection projection -> projection.getProjectionElemList()
+					.getElements()
+					.stream()
+					.anyMatch(
+							elem -> name.equals(elem.getName()) && name.equals(elem.getProjectionAlias().orElse(name)));
+			case null, default -> false;
+			};
+			if (!forwardsRows) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private static boolean readHasNoIncomingValue(ReadOnlyContext input, String name) {

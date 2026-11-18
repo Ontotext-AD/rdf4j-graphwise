@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -22,6 +23,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -37,6 +39,11 @@ import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.MalformedQueryException;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
 import org.eclipse.rdf4j.query.QueryParseOptions;
+import org.eclipse.rdf4j.query.algebra.BindingSetAssignment;
+import org.eclipse.rdf4j.query.algebra.Exists;
+import org.eclipse.rdf4j.query.algebra.Group;
+import org.eclipse.rdf4j.query.algebra.ProjectionElem;
+import org.eclipse.rdf4j.query.algebra.QueryModelNode;
 import org.eclipse.rdf4j.query.algebra.QueryRoot;
 import org.eclipse.rdf4j.query.algebra.Service;
 import org.eclipse.rdf4j.query.algebra.Slice;
@@ -46,6 +53,7 @@ import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedServiceIde
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractSimpleQueryModelVisitor;
 import org.eclipse.rdf4j.query.algebra.helpers.PreparedQueryBindingPlan;
 import org.eclipse.rdf4j.query.algebra.helpers.PreparedQueryBindingPlan.ServiceReadValidator;
+import org.eclipse.rdf4j.query.algebra.helpers.QueryAlgebraBindingAnalysis;
 import org.eclipse.rdf4j.query.impl.BlankNodeReferences;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
@@ -115,17 +123,17 @@ public class SPARQLQueries {
 	 */
 	public static void initializeServiceReferences(Service service) {
 		Objects.requireNonNull(service);
-		if (service.isBNodeReferenceMetadataInitialized() && service.hasSavedPossibleReadNames()) {
+		if (service.isBNodeReferenceMetadataInitialized() && service.getSavedExistsBindingNames() != null) {
 			return;
 		}
 		synchronized (service) {
-			if (service.isBNodeReferenceMetadataInitialized() && service.hasSavedPossibleReadNames()) {
+			if (service.isBNodeReferenceMetadataInitialized() && service.getSavedExistsBindingNames() != null) {
 				return;
 			}
 			try {
 				ASTQueryContainer syntax = SyntaxTreeBuilder.parseQuery(service.getAskQueryString());
-				if (!service.hasSavedPossibleReadNames()) {
-					service.setSavedBindingNames(lexicalBindingNames(syntax), possibleBindingReadNames(syntax));
+				if (service.getSavedExistsBindingNames() == null) {
+					initializeServiceBindingNames(service, syntax);
 				}
 				if (!service.isBNodeReferenceMetadataInitialized()) {
 					Set<String> ids = BNodeReferenceProcessor.process(syntax, QueryParseOptions.DEFAULT);
@@ -151,6 +159,106 @@ public class SPARQLQueries {
 				throw new MalformedQueryException("Invalid SERVICE request syntax: " + failure.getMessage(), failure);
 			}
 		}
+	}
+
+	static void initializeServiceBindingNames(Service service, Node syntax) {
+		Set<String> existsNames = new LinkedHashSet<>();
+		collectExistsBindingNames(syntax, existsNames);
+		service.setSavedBindingNames(lexicalBindingNames(syntax), possibleBindingReadNames(syntax), existsNames);
+	}
+
+	private static void collectExistsBindingNames(Node syntax, Set<String> names) {
+		if (syntax instanceof ASTExistsFunc || syntax instanceof ASTNotExistsFunc) {
+			collectBoundNames(syntax, (Set<String>) null, names);
+			return;
+		}
+		for (int i = 0; i < syntax.jjtGetNumChildren(); i++) {
+			collectExistsBindingNames(syntax.jjtGetChild(i), names);
+		}
+	}
+
+	/**
+	 * Supplies the real output columns of a constant-IRI SERVICE when an injected caller binding can change an
+	 * existential expression's result. Callers evaluate that SERVICE independently before joining its result.
+	 */
+	@InternalUseOnly
+	public static Optional<Set<String>> independentExistsOutputNames(Service service, List<BindingSet> rows,
+			BindingSet nativeParameters) {
+		initializeServiceReferences(service);
+		Set<String> lexicalNames = service.getSavedExistsBindingNames();
+		if (!hasRuntimeInput(rows, nativeParameters, lexicalNames)) {
+			return Optional.empty();
+		}
+		Service.ExistsScopeFacts facts = service.getExistsScopeFacts();
+		if (facts == null) {
+			synchronized (service) {
+				facts = service.getExistsScopeFacts();
+				if (facts == null) {
+					facts = existsScopeFacts(service, lexicalNames);
+					service.setExistsScopeFacts(facts);
+				}
+			}
+		}
+		return hasRuntimeInput(rows, nativeParameters, facts.observedInputNames())
+				? Optional.of(facts.outputNames())
+				: Optional.empty();
+	}
+
+	private static boolean hasRuntimeInput(List<BindingSet> rows, BindingSet nativeParameters, Set<String> names) {
+		if (names.isEmpty()) {
+			return false;
+		}
+		for (BindingSet row : rows) {
+			for (String name : names) {
+				if (!nativeParameters.hasBinding(name) && row.getValue(name) != null) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private static Service.ExistsScopeFacts existsScopeFacts(Service service, Set<String> lexicalNames) {
+		// Optimizers may move or erase reads from the caller's algebra. Analyze the source that will be sent.
+		TupleExpr source = new SPARQLParser().parseQuery(service.getAskQueryString(), service.getBaseURI())
+				.getTupleExpr();
+		QueryAlgebraBindingAnalysis analysis = QueryAlgebraBindingAnalysis.withBindingValues(source,
+				EmptyBindingSet.getInstance());
+		Set<String> observed = new HashSet<>();
+		analysis.visitScoped(source, analysis.rootContext(), (node, input) -> {
+			Set<String> names = switch (node) {
+			case Var variable when !variable.hasValue() -> Set.of(variable.getName());
+			case BindingSetAssignment assignment -> assignment.getPossibleBindingNames();
+			case ProjectionElem projection -> Set.of(projection.getName());
+			case Group group -> group.getGroupBindingNames();
+			default -> Set.of();
+			};
+			if (!Collections.disjoint(names, lexicalNames) && insideExists(node)) {
+				// EXISTS (including NOT EXISTS) observes the remote row's actual domain. A caller's value
+				// can fill a missing binding and change its truth value before a compatibility check.
+				for (String name : names) {
+					if (lexicalNames.contains(name)
+							&& (!input.bindingDomainKnown() || !input.guaranteedNames().contains(name))) {
+						observed.add(name);
+					}
+				}
+			}
+			return true;
+		});
+		var outputs = analysis.outputFacts(source);
+		Set<String> names = new HashSet<>(outputs.possibleOutputsKnown() ? outputs.possibleOutputs()
+				: source.getBindingNames());
+		names.retainAll(service.getSavedBindingNames());
+		return new Service.ExistsScopeFacts(observed, names);
+	}
+
+	private static boolean insideExists(QueryModelNode node) {
+		for (QueryModelNode ancestor = node.getParentNode(); ancestor != null; ancestor = ancestor.getParentNode()) {
+			if (ancestor instanceof Exists) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**

@@ -406,6 +406,9 @@ public class LuceneSailConnection extends NotifyingSailConnectionWrapper {
 			Dataset dataset, BindingSet bindings, boolean includeInferred) throws SailException {
 		QueryContext qctx = new QueryContext();
 		SearchIndexQueryContextInitializer.init(qctx, luceneIndex);
+		SearchIndexQueryContextInitializer.setGeometrySource(qctx,
+				(subject, property, geometry, context) -> hasIndexedGeometry(subject, property, geometry, context,
+						includeInferred));
 		SearchQueryBindingResolver.setReadDataset(qctx, dataset);
 
 		final CloseableIteration<? extends BindingSet> iter;
@@ -419,6 +422,20 @@ public class LuceneSailConnection extends NotifyingSailConnectionWrapper {
 		// NB: Iteration methods may do on-demand evaluation hence need to wrap
 		// these too
 		return new QueryContextIteration(iter, qctx);
+	}
+
+	private boolean hasIndexedGeometry(Resource subject, IRI property, Literal geometry, Resource context,
+			boolean includeInferred) {
+		// The index can map several source predicates onto the same geometry field.
+		try (var matches = getWrappedConnection().getStatements(subject, null, geometry, includeInferred, context)) {
+			while (matches.hasNext()) {
+				Statement mapped = sail.mapStatement(matches.next());
+				if (mapped != null && property.equals(mapped.getPredicate())) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	private CloseableIteration<? extends BindingSet> evaluateInternal(TupleExpr tupleExpr,

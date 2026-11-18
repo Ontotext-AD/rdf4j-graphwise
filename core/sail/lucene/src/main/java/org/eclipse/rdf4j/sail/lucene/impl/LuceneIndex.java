@@ -31,6 +31,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
 import org.apache.commons.lang3.math.NumberUtils;
@@ -84,6 +85,7 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.util.Bits;
+import org.eclipse.rdf4j.common.iteration.LookAheadIteration;
 import org.eclipse.rdf4j.common.iterator.EmptyIterator;
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.Resource;
@@ -114,7 +116,6 @@ import org.slf4j.LoggerFactory;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Sets;
 
 /**
  * A LuceneIndex is a one-stop-shop abstraction of a Lucene index. It takes care of proper synchronization of
@@ -132,6 +133,11 @@ public class LuceneIndex extends AbstractLuceneIndex {
 
 	private static final String GEO_FIELD_PREFIX = "_geo_";
 	private static final String POINT_FIELD_PREFIX = "_pt_";
+	private static final int GEOMETRY_PAGE_SIZE = 128;
+	private static final double COORDINATE_PRECISION_METRES = GeoUnits.fromDegrees(
+			GeoEncodingUtils.decodeLatitude(1) + GeoEncodingUtils.decodeLongitude(1), GEOF.UOM_METRE);
+	// SloppyMath.haversinMeters documents a maximum approximation error of 40 centimetres.
+	private static final double DISTANCE_PRECISION_METRES = 0.4;
 
 	private final Logger logger = LoggerFactory.getLogger(getClass());
 
@@ -921,26 +927,25 @@ public class LuceneIndex extends AbstractLuceneIndex {
 	}
 
 	@Override
+	protected boolean usesExactGeometryLiterals() {
+		return true;
+	}
+
+	@Override
 	protected Iterable<? extends DocumentDistance> geoQuery(final IRI geoProperty, Point p, final IRI units,
 			double distance, String distanceVar, Var contextVar) throws MalformedQueryException, IOException {
-		double degs = GeoUnits.toDegrees(distance, units);
 		final String geoField = SearchFields.getPropertyField(geoProperty);
-		SpatialContext context = SpatialContext.GEO;
-		final Shape boundingCircle = context.getShapeFactory().circle(p, degs);
 
-		// use LatLonPoint for distance query after indexing it with the same data structure
-
-		Query q = LatLonPoint.newDistanceQuery(POINT_FIELD_PREFIX + geoField, p.getY(), p.getX(), distance);
+		double radiusDegrees = Math.min(GeoUnits.toDegrees(distance, units), 180);
+		double radiusMetres = GeoUnits.fromDegrees(radiusDegrees, GEOF.UOM_METRE)
+				+ COORDINATE_PRECISION_METRES + DISTANCE_PRECISION_METRES;
+		Query q = LatLonPoint.newDistanceQuery(POINT_FIELD_PREFIX + geoField, p.getY(), p.getX(), radiusMetres);
 		if (contextVar != null) {
 			q = addContextTerm(q, (Resource) contextVar.getValue());
 		}
 
-		TopDocs docs = search(q);
-		final boolean requireContext = (contextVar != null && !contextVar.hasValue());
-		return Iterables.transform(Arrays.asList(docs.scoreDocs),
-				(ScoreDoc doc) -> new LuceneDocumentDistance(doc, geoField, units, boundingCircle.getCenter(),
-						requireContext,
-						LuceneIndex.this));
+		return geometryHits(q,
+				(doc, reader) -> new LuceneDocumentDistance(doc, geoField, units, p, true, this, reader));
 	}
 
 	private Query addContextTerm(Query q, Resource ctx) {
@@ -995,13 +1000,62 @@ public class LuceneIndex extends AbstractLuceneIndex {
 			q = addContextTerm(q, (Resource) contextVar.getValue());
 		}
 
-		TopDocs docs = getIndexSearcher().search(q, Math.max(getIndexReader().numDocs(), 1));
-		final Set<String> fields = Sets.newHashSet(SearchFields.URI_FIELD_NAME, geoField);
-		if (contextVar != null && !contextVar.hasValue()) {
-			fields.add(SearchFields.CONTEXT_FIELD_NAME);
+		Set<String> fields = Set.of(SearchFields.URI_FIELD_NAME, SearchFields.CONTEXT_FIELD_NAME, geoField);
+		return geometryHits(q, (doc, reader) -> new LuceneDocumentResult(doc, this, fields, reader));
+	}
+
+	private synchronized <H extends DocumentResult> GeometryHits<H> geometryHits(Query query,
+			BiFunction<ScoreDoc, IndexReader, H> toHit) throws IOException {
+		IndexSearcher searcher = getIndexSearcher();
+		// Commits may replace the current searcher between pages. Keep the same reader for every page and stored hit.
+		searcher.getIndexReader().incRef();
+		return new PagedGeometryHits<>(searcher, query, toHit);
+	}
+
+	private static final class PagedGeometryHits<H extends DocumentResult> extends LookAheadIteration<H>
+			implements GeometryHits<H> {
+
+		private final IndexSearcher searcher;
+		private final Query query;
+		private final BiFunction<ScoreDoc, IndexReader, H> toHit;
+		private ScoreDoc[] page = new ScoreDoc[0];
+		private ScoreDoc after;
+		private int next;
+
+		private PagedGeometryHits(IndexSearcher searcher, Query query, BiFunction<ScoreDoc, IndexReader, H> toHit) {
+			this.searcher = searcher;
+			this.query = query;
+			this.toHit = toHit;
 		}
-		return Iterables.transform(Arrays.asList(docs.scoreDocs),
-				(ScoreDoc doc) -> new LuceneDocumentResult(doc, LuceneIndex.this, fields));
+
+		@Override
+		protected H getNextElement() {
+			if (next == page.length) {
+				if (after != null && page.length < GEOMETRY_PAGE_SIZE) {
+					return null;
+				}
+				try {
+					page = searcher.searchAfter(after, query, GEOMETRY_PAGE_SIZE).scoreDocs;
+				} catch (IOException e) {
+					throw new SailException("Could not read spatial index candidates", e);
+				}
+				if (page.length == 0) {
+					return null;
+				}
+				after = page[page.length - 1];
+				next = 0;
+			}
+			return toHit.apply(page[next++], searcher.getIndexReader());
+		}
+
+		@Override
+		protected void handleClose() {
+			try {
+				searcher.getIndexReader().decRef();
+			} catch (IOException e) {
+				throw new SailException("Could not close the spatial index reader", e);
+			}
+		}
 	}
 
 	@Override
@@ -1208,7 +1262,7 @@ public class LuceneIndex extends AbstractLuceneIndex {
 		}
 	}
 
-	private static Document readDocument(IndexReader reader, int docId, Set<String> fieldsToLoad) throws IOException {
+	static Document readDocument(IndexReader reader, int docId, Set<String> fieldsToLoad) throws IOException {
 		DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor(fieldsToLoad);
 		reader.storedFields().document(docId, visitor);
 		return visitor.getDocument();

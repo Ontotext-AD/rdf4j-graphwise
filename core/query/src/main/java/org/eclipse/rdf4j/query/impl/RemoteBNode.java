@@ -231,22 +231,33 @@ public final class RemoteBNode extends SimpleBNode {
 
 		public void seedOriginalBindings(BindingSet bindings) {
 			allocation.reserve(bindings);
-			if (canonicalIDs) {
-				for (Binding binding : bindings) {
-					seedIdentity(binding.getValue());
-				}
+			if (!canonicalIDs || bindings == null) {
+				return;
+			}
+			Set<Value> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+			ArrayDeque<Value> pending = new ArrayDeque<>();
+			for (Binding binding : bindings) {
+				seedIdentity(binding.getValue(), visited, pending);
 			}
 		}
 
-		private void seedIdentity(Value value) {
-			if (value instanceof RemoteBNode remote) {
-				Provenance provenance = requireProvenance(remote);
-				if (provenance.canonicalResultID() && provenance.identityScope() == identityScope) {
-					canonicalOriginals.putIfAbsent(provenance.remoteID(), remote);
+		private void seedIdentity(Value value, Set<Value> visited, ArrayDeque<Value> pending) {
+			if (value == null) {
+				return;
+			}
+			pending.push(value);
+			while (!pending.isEmpty()) {
+				Value current = pending.pop();
+				if (current instanceof RemoteBNode remote && visited.add(remote)) {
+					Provenance provenance = requireProvenance(remote);
+					if (provenance.canonicalResultID() && provenance.identityScope() == identityScope) {
+						canonicalOriginals.putIfAbsent(provenance.remoteID(), remote);
+					}
+				} else if (current instanceof TripleTerm triple && visited.add(triple)) {
+					// Visit the subject first to preserve precedence when both components seed the same ID.
+					pending.push(triple.getObject());
+					pending.push(triple.getSubject());
 				}
-			} else if (value instanceof TripleTerm triple) {
-				seedIdentity(triple.getSubject());
-				seedIdentity(triple.getObject());
 			}
 		}
 

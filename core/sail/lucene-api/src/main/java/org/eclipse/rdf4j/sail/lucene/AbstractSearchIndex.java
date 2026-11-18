@@ -20,14 +20,18 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Properties;
 import java.util.Set;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 
 import org.apache.lucene.geo.SimpleWKTShapeParser;
+import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.Literal;
 import org.eclipse.rdf4j.model.Resource;
@@ -187,6 +191,11 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 		return (wktFields != null) && wktFields.contains(fieldName);
 	}
 
+	/** Whether geometry fields index only WKT literals and spatial hits are verified against individual RDF terms. */
+	protected boolean usesExactGeometryLiterals() {
+		return false;
+	}
+
 	@Override
 	public boolean isTypeStatement(Statement statement) {
 		return isTypeFilteringEnabled()
@@ -219,7 +228,7 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 	@Override
 	public final synchronized void addStatement(Statement statement) throws IOException {
 		// determine stuff to store
-		String text = SearchFields.getLiteralPropertyValueAsString(statement);
+		String text = getIndexValue(statement);
 		if (text == null) {
 			return;
 		}
@@ -259,7 +268,7 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 
 	@Override
 	public final synchronized void removeStatement(Statement statement) throws IOException {
-		String text = SearchFields.getLiteralPropertyValueAsString(statement);
+		String text = getIndexValue(statement);
 		if (text == null) {
 			return;
 		}
@@ -356,8 +365,9 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 						}
 					}
 
-					// add it to the index
-					updater.add(document);
+					if (countPropertyValues(document) > 0) {
+						updater.add(document);
+					}
 
 					// THERE SHOULD BE NO DELETED TRIPLES ON A NEWLY ADDED RESOURCE
 					if (stmtsToRemove.containsKey(contextId)) {
@@ -375,7 +385,7 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 						if (removedStatements != null && !removedStatements.isEmpty()) {
 							removedOfResource = new HashMap<>();
 							for (Statement r : removedStatements) {
-								String val = SearchFields.getLiteralPropertyValueAsString(r);
+								String val = getIndexValue(r);
 								if (val != null) {
 									// remove value from both property field and the
 									// corresponding text field
@@ -399,7 +409,7 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 						if (addedToResource != null && !addedToResource.isEmpty()) {
 							PropertyCache propertyCache = new PropertyCache(newDocument);
 							for (Statement s : addedToResource) {
-								val = SearchFields.getLiteralPropertyValueAsString(s);
+								val = getIndexValue(s);
 								if (val != null) {
 									String field = SearchFields.getPropertyField(s.getPredicate());
 									if (!propertyCache.hasProperty(field, val)) {
@@ -498,8 +508,9 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 				// determine stuff to store
 				addProperty(stmt, document);
 			}
-			// add it to the index
-			batch.add(document);
+			if (countPropertyValues(document) > 0) {
+				batch.add(document);
+			}
 		}
 		batch.end();
 	}
@@ -512,12 +523,21 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 	 * @param document  the document to add to
 	 */
 	private void addProperty(Statement statement, SearchDocument document) {
-		String value = SearchFields.getLiteralPropertyValueAsString(statement);
+		String value = getIndexValue(statement);
 		if (value == null) {
 			return;
 		}
 		String field = SearchFields.getPropertyField(statement.getPredicate());
 		addProperty(field, value, document);
+	}
+
+	private String getIndexValue(Statement statement) {
+		if (statement.getObject() instanceof Literal literal
+				&& (!usesExactGeometryLiterals() || GEO.WKT_LITERAL.equals(literal.getDatatype())
+						|| !isGeoField(SearchFields.getPropertyField(statement.getPredicate())))) {
+			return literal.getLabel();
+		}
+		return null;
 	}
 
 	private void addProperty(String field, String value, SearchDocument document) {
@@ -536,16 +556,24 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 			return generateBindingSets(query, result);
 		} else if (evaluator instanceof DistanceQuerySpec) {
 			DistanceQuerySpec query = (DistanceQuerySpec) evaluator;
-			Iterable<? extends DocumentDistance> result = evaluateQuery(query);
-			return generateBindingSets(query, result);
+			return evaluateDistance(query, List.of(query));
 		} else if (evaluator instanceof GeoRelationQuerySpec) {
 			GeoRelationQuerySpec query = (GeoRelationQuerySpec) evaluator;
-			Iterable<? extends DocumentResult> result = evaluateQuery(query);
-			return generateBindingSets(query, result);
+			return evaluateRelation(query, List.of(query));
 		} else {
 			throw new IllegalArgumentException("Unsupported " + SearchQueryEvaluator.class.getSimpleName() + ": "
 					+ evaluator.getClass().getName());
 		}
+	}
+
+	final Collection<BindingSet> evaluateMergedGeometry(MergedDefaultGraphQuery merged) throws SailException {
+		return switch (merged.query()) {
+		case DistanceQuerySpec query ->
+			evaluateDistance(query, merged.lookups().stream().map(DistanceQuerySpec.class::cast).toList());
+		case GeoRelationQuerySpec query ->
+			evaluateRelation(query, merged.lookups().stream().map(GeoRelationQuerySpec.class::cast).toList());
+		default -> throw new IllegalArgumentException("Only spatial queries can merge default graph lookups");
+		};
 	}
 
 	/**
@@ -757,87 +785,28 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 		}
 	}
 
-	private BindingSetCollection generateBindingSets(DistanceQuerySpec query,
-			Iterable<? extends DocumentDistance> hits) throws SailException {
-		// Since one resource can be returned many times, it can lead now to
-		// multiple occurrences
-		// of the same binding tuple in the BINDINGS clause. This in turn leads to
-		// duplicate answers in the original SPARQL query.
-		// We want to avoid this, so BindingSets added to the result must be
-		// unique.
-		LinkedHashSet<BindingSet> bindingSets = new LinkedHashSet<>();
-
-		HashSet<String> bindingNames = new HashSet<>();
-		final String subjVar = query.getSubjectVar();
-		if (subjVar != null) {
-			bindingNames.add(subjVar);
+	private BindingSetCollection evaluateDistance(DistanceQuerySpec query, List<DistanceQuerySpec> lookups) {
+		var projection = new GeometryProjection(query.getGeoProperty(), query.getSubjectVar(), query.getGeoVar(),
+				query.getContextVar(), query.getDistanceVar());
+		if (!usesExactGeometryLiterals()) {
+			return generateGeometryBindingSets(lookups, this::evaluateQuery, projection,
+					(DocumentDistance hit, Literal geometry) -> {
+						double distance = hit.getDistance();
+						return distance < query.getDistance() ? SearchFields.distanceToLiteral(distance) : null;
+					});
 		}
-		final String geoVar = query.getGeoVar();
-		if (geoVar != null) {
-			bindingNames.add(geoVar);
+		var distance = FunctionRegistry.getInstance().get(GEOF.DISTANCE.stringValue()).orElse(null);
+		if (distance == null) {
+			return new BindingSetCollection(projection.bindingNames(), new LinkedHashSet<>());
 		}
-		final String distanceVar = query.getDistanceVar();
-		if (distanceVar != null) {
-			bindingNames.add(distanceVar);
-		}
-		final Var contextVar = query.getContextVar();
-		if (contextVar != null && !contextVar.hasValue()) {
-			bindingNames.add(contextVar.getName());
-		}
-
-		if (hits != null) {
-
-			double maxDistance = query.getDistance();
-			// for each hit ...
-			for (DocumentDistance hit : hits) {
-				// get the current hit
-				SearchDocument doc = hit.getDocument();
-				if (doc == null) {
-					continue;
-				}
-
-				List<String> geometries = doc.getProperty(SearchFields.getPropertyField(query.getGeoProperty()));
-				for (String geometry : geometries) {
-					double distance = hit.getDistance();
-					// Distance queries are generally implemented by checking
-					// if indexed points intersect with a bounding disc.
-					// Unfortunately, this means the results may potentially also
-					// include other indexed shapes that intersect with the disc.
-					// The distances assigned to these other shapes may well be
-					// greater than the original bounding distance.
-					// We could exclude such results by checking if the shapes are
-					// points,
-					// but instead we do a faster sanity check of the distance.
-					// This has the potential (desirable?) side-effect of extending
-					// the distance function
-					// to arbitrary shapes.
-					if (distance < maxDistance) {
-						QueryBindingSet derivedBindings = new QueryBindingSet();
-						if (subjVar != null) {
-							Resource resource = getResource(doc);
-							derivedBindings.addBinding(subjVar, resource);
-						}
-						if (contextVar != null && !contextVar.hasValue()) {
-							Resource ctx = SearchFields.createContext(doc.getContext());
-							if (ctx != null) {
-								derivedBindings.addBinding(contextVar.getName(), ctx);
-							}
-						}
-						if (geoVar != null) {
-							derivedBindings.addBinding(geoVar, SearchFields.wktToLiteral(geometry));
-						}
-						if (distanceVar != null) {
-							derivedBindings.addBinding(distanceVar, SearchFields.distanceToLiteral(distance));
-						}
-
-						bindingSets.add(derivedBindings);
-					}
-				}
+		return generateGeometryBindingSets(lookups, this::evaluateQuery, projection, (hit, geometry) -> {
+			try {
+				Value value = distance.evaluate(vf, query.getFrom(), geometry, query.getUnits());
+				return value instanceof Literal literal && literal.doubleValue() < query.getDistance() ? value : null;
+			} catch (ValueExprEvaluationException invalidGeometry) {
+				return null;
 			}
-		}
-
-		// we succeeded
-		return new BindingSetCollection(bindingNames, bindingSets);
+		});
 	}
 
 	private Iterable<? extends DocumentResult> evaluateQuery(GeoRelationQuerySpec query) {
@@ -860,93 +829,110 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 		return hits;
 	}
 
-	private BindingSetCollection generateBindingSets(GeoRelationQuerySpec query,
-			Iterable<? extends DocumentResult> hits) throws SailException {
-		// Since one resource can be returned many times, it can lead now to
-		// multiple occurrences
-		// of the same binding tuple in the BINDINGS clause. This in turn leads to
-		// duplicate answers in the original SPARQL query.
-		// We want to avoid this, so BindingSets added to the result must be
-		// unique.
-		LinkedHashSet<BindingSet> bindingSets = new LinkedHashSet<>();
-
-		HashSet<String> bindingNames = new HashSet<>();
-		final String subjVar = query.getSubjectVar();
-		if (subjVar != null) {
-			bindingNames.add(subjVar);
-		}
-		final String geoVar = query.getGeoVar();
-		if (geoVar != null) {
-			bindingNames.add(geoVar);
-		}
-		final String fVar = query.getFunctionValueVar();
-		if (fVar != null) {
-			bindingNames.add(fVar);
-		}
-		final Var contextVar = query.getContextVar();
-		if (contextVar != null && !contextVar.hasValue()) {
-			bindingNames.add(contextVar.getName());
-		}
-
+	private BindingSetCollection evaluateRelation(GeoRelationQuerySpec query, List<GeoRelationQuerySpec> lookups) {
+		var projection = new GeometryProjection(query.getGeoProperty(), query.getSubjectVar(), query.getGeoVar(),
+				query.getContextVar(), query.getFunctionValueVar());
 		var relation = FunctionRegistry.getInstance().get(query.getRelation()).orElse(null);
-		int documentLimit = defaultNumDocs < 0 ? maxDocs : defaultNumDocs;
-		if (hits != null && relation != null && documentLimit > 0) {
-			String field = SearchFields.getPropertyField(query.getGeoProperty());
-			int matchedDocuments = 0;
-			// for each hit ...
-			for (DocumentResult hit : hits) {
-				// get the current hit
-				SearchDocument doc = hit.getDocument();
-				if (doc == null) {
-					continue;
-				}
+		if (relation == null) {
+			return new BindingSetCollection(projection.bindingNames(), new LinkedHashSet<>());
+		}
+		return generateGeometryBindingSets(lookups, this::evaluateQuery, projection, (hit, geometry) -> {
+			try {
+				Value value = relation.evaluate(vf, query.getQueryGeometry(), geometry);
+				return QueryEvaluationUtil.getEffectiveBooleanValue(value) ? value : null;
+			} catch (ValueExprEvaluationException invalidGeometry) {
+				return null;
+			}
+		});
+	}
 
-				List<String> geometries = doc.getProperty(field);
-				if (geometries == null) {
-					continue;
-				}
-				boolean matched = false;
-				for (String geometry : geometries) {
-					Literal geometryLiteral = SearchFields.wktToLiteral(geometry);
-					Value relationValue;
-					try {
-						relationValue = relation.evaluate(vf, query.getQueryGeometry(), geometryLiteral);
-						if (!QueryEvaluationUtil.getEffectiveBooleanValue(relationValue)) {
-							continue;
-						}
-					} catch (ValueExprEvaluationException invalidGeometry) {
-						// A geometry error rejects this solution just as it does in a scalar FILTER.
+	private record GeometryProjection(IRI property, String subject, String geometry, Var context, String value) {
+
+		private String contextName() {
+			return context != null && !context.hasValue() ? context.getName() : null;
+		}
+
+		private HashSet<String> bindingNames() {
+			HashSet<String> names = new HashSet<>(Arrays.asList(subject, geometry, contextName(), value));
+			names.remove(null);
+			return names;
+		}
+	}
+
+	private <Q extends SearchQueryEvaluator, H extends DocumentResult> BindingSetCollection generateGeometryBindingSets(
+			List<Q> lookups, Function<Q, Iterable<? extends H>> loadHits, GeometryProjection projection,
+			BiFunction<H, Literal, Value> evaluateGeometry) {
+		// Preserve merged-graph set semantics while counting matching documents, which can contribute several rows.
+		LinkedHashSet<BindingSet> bindingSets = new LinkedHashSet<>();
+		int remaining = defaultNumDocs < 0 ? maxDocs : defaultNumDocs;
+		var geometrySource = usesExactGeometryLiterals() ? SearchIndexQueryContextInitializer.getGeometrySource(this)
+				: null;
+		String field = SearchFields.getPropertyField(projection.property());
+		String contextName = projection.contextName();
+		for (Q lookup : lookups) {
+			if (remaining <= 0) {
+				break;
+			}
+			Iterable<? extends H> hits = loadHits.apply(lookup);
+			if (hits == null) {
+				continue;
+			}
+			try (GeometryHits<?> ownedHits = hits instanceof GeometryHits<?> cursor ? cursor : null) {
+				for (H hit : hits) {
+					SearchDocument document = hit.getDocument();
+					if (document == null) {
 						continue;
 					}
-					matched = true;
-					QueryBindingSet derivedBindings = new QueryBindingSet();
-					if (geoVar != null) {
-						derivedBindings.addBinding(geoVar, geometryLiteral);
-					}
-					if (subjVar != null) {
-						Resource resource = getResource(doc);
-						derivedBindings.addBinding(subjVar, resource);
-					}
-					if (contextVar != null && !contextVar.hasValue()) {
-						Resource ctx = SearchFields.createContext(doc.getContext());
-						if (ctx != null) {
-							derivedBindings.addBinding(contextVar.getName(), ctx);
-						}
-					}
-					if (fVar != null) {
-						derivedBindings.addBinding(fVar, relationValue);
+					List<String> geometries = document.getProperty(field);
+					if (geometries == null || geometries.isEmpty()) {
+						continue;
 					}
 
-					bindingSets.add(derivedBindings);
-				}
-				if (matched && ++matchedDocuments == documentLimit) {
-					break;
+					Resource subject = geometrySource != null || projection.subject() != null
+							? getResource(document)
+							: null;
+					String contextId = geometrySource != null || contextName != null ? document.getContext() : null;
+					Resource context = contextId != null ? SearchFields.createContext(contextId) : null;
+					boolean matched = false;
+					for (String geometry : geometries) {
+						Literal literal = SearchFields.wktToLiteral(geometry);
+						Value value = evaluateGeometry.apply(hit, literal);
+						// Older indexes stored only the label and may contain non-WKT literals with the same label.
+						if (value == null || geometrySource != null
+								&& !geometrySource.contains(subject, projection.property(), literal, context)) {
+							continue;
+						}
+						matched = true;
+						QueryBindingSet bindings = new QueryBindingSet();
+						if (projection.subject() != null) {
+							bindings.addBinding(projection.subject(), subject);
+						}
+						if (projection.geometry() != null) {
+							bindings.addBinding(projection.geometry(), literal);
+						}
+						if (contextName != null && context != null) {
+							bindings.addBinding(contextName, context);
+						}
+						if (projection.value() != null) {
+							bindings.addBinding(projection.value(), value);
+						}
+						bindingSets.add(bindings);
+					}
+					if (matched && --remaining == 0) {
+						break;
+					}
 				}
 			}
 		}
+		return new BindingSetCollection(projection.bindingNames(), bindingSets);
+	}
 
-		// we succeeded
-		return new BindingSetCollection(bindingNames, bindingSets);
+	/** A spatial hit cursor whose resources are released when collection stops, including at the document limit. */
+	protected interface GeometryHits<H extends DocumentResult> extends Iterable<H>, CloseableIteration<H> {
+		@Override
+		default Iterator<H> iterator() {
+			return this;
+		}
 	}
 
 	protected Object parseLuceneQueryShape(String property, String value) throws ParseException, IOException {
