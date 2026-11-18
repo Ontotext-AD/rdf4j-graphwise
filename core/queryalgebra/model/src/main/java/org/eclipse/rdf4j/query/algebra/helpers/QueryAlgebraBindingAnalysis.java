@@ -1358,7 +1358,7 @@ public final class QueryAlgebraBindingAnalysis {
 		if (expression instanceof Slice) {
 			return true;
 		}
-		if (expression instanceof Distinct || expression instanceof Reduced) {
+		if (expression instanceof Distinct distinct && !distinct.isInputScoped() || expression instanceof Reduced) {
 			TupleExpr argument = ((UnaryTupleOperator) expression).getArg();
 			OutputFacts facts = outputFacts(argument, childInput(expression, argument, input));
 			if (!facts.possibleOutputsKnown() || !facts.guaranteedOutputsKnown()

@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 import java.io.IOException;
 import java.io.StringReader;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -61,9 +62,12 @@ import org.eclipse.rdf4j.repository.util.Repositories;
 import org.eclipse.rdf4j.rio.RDFFormat;
 import org.eclipse.rdf4j.sail.evaluation.TupleFunctionEvaluationMode;
 import org.eclipse.rdf4j.sail.lucene.DistanceQuerySpec;
+import org.eclipse.rdf4j.sail.lucene.DistanceQuerySpecBuilder;
 import org.eclipse.rdf4j.sail.lucene.DocumentDistance;
 import org.eclipse.rdf4j.sail.lucene.LuceneSail;
 import org.eclipse.rdf4j.sail.lucene.LuceneSailSchema;
+import org.eclipse.rdf4j.sail.lucene.SearchQueryEvaluator;
+import org.eclipse.rdf4j.sail.lucene.SearchQueryInterpreter;
 import org.eclipse.rdf4j.sail.memory.MemoryStore;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
@@ -87,6 +91,137 @@ public class LuceneGeoTest {
 	private static final String ORIGIN_VALUES = """
 			VALUES (?p ?origin) { (<urn:location> 'POINT(0 0)'^^geo:wktLiteral) }
 			""";
+
+	@TestFactory
+	Stream<DynamicTest> geometryLookupsRespectTheQueryDataset() {
+		String pattern = "?s <urn:location> ?wkt FILTER(%s)";
+		String polygon = "VALUES ?shape { 'POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'^^geo:wktLiteral } ";
+		return Stream.of("geof:ehContains(?shape, ?wkt)", DISTANCE)
+				.map(condition -> dynamicTest(condition, () -> {
+					var repository = mappedGeometryRepository(new RecordingIndex(),
+							TupleFunctionEvaluationMode.TRIPLE_SOURCE, new TupleFunctionRegistry());
+					try (var connection = repository.getConnection()) {
+						var point = Values.literal("POINT(0 0)", CoreDatatype.GEO.WKT_LITERAL);
+						connection.add(NEAR, SOURCE_LOCATION, point, Values.iri("urn:g1"), Values.iri("urn:g2"));
+						connection.add(FAR, SOURCE_LOCATION, point, Values.iri("urn:g3"));
+						String body = polygon + pattern.formatted(condition);
+						assertSubjects(connection, "FROM <urn:g1> WHERE {" + body + "}", List.of(NEAR));
+						assertSubjects(connection, "FROM <urn:absent> FROM <urn:g1> WHERE {" + body + "}",
+								List.of(NEAR));
+						assertSubjects(connection, "FROM <urn:g1> FROM <urn:g2> WHERE {" + body + "}",
+								List.of(NEAR));
+						assertSubjects(connection, "FROM NAMED <urn:g1> WHERE {" + body + "}", List.of());
+						assertSubjects(connection, "FROM NAMED <urn:g1> WHERE { GRAPH ?g {" + body + "} }",
+								List.of(NEAR));
+						assertSubjects(connection, "WHERE { GRAPH <urn:g1> {" + body + "} }", List.of(NEAR));
+						connection.add(NEAR, SOURCE_LOCATION,
+								Values.literal("POINT(0.001 0)", CoreDatatype.GEO.WKT_LITERAL), Values.iri("urn:g2"));
+						assertSubjects(connection, "FROM <urn:g1> FROM <urn:g2> WHERE {" + body + "}",
+								List.of(NEAR, NEAR));
+					} finally {
+						repository.shutDown();
+					}
+				}));
+	}
+
+	@Test
+	void runtimeDistanceMergesGraphsWithinEachInputRow() throws Exception {
+		var index = new RecordingIndex();
+		var functions = new TupleFunctionRegistry();
+		functions.add(new RecordingDistanceProvider(index));
+		var repository = mappedGeometryRepository(index, TupleFunctionEvaluationMode.TRIPLE_SOURCE, functions);
+		try (var connection = repository.getConnection()) {
+			var point = Values.literal("POINT(0 0)", CoreDatatype.GEO.WKT_LITERAL);
+			connection.add(NEAR, SOURCE_LOCATION, point, Values.iri("urn:g1"), Values.iri("urn:g2"));
+			connection.add(FAR, SOURCE_LOCATION, point, Values.iri("urn:g3"));
+			var farther = Values.literal("POINT(10 10)", CoreDatatype.GEO.WKT_LITERAL);
+			connection.add(OTHER, LOCATION, farther, Values.iri("urn:g1"), Values.iri("urn:g2"));
+			connection.add(FAR, LOCATION, farther, Values.iri("urn:g3"));
+			var branch = Values.iri("urn:branch");
+			String distance = DISTANCE.replace("1000", "?limit").replace("?wkt", "?context");
+			assertSubjects(connection, """
+					FROM <urn:g1> FROM <urn:g2> WHERE {
+					  { VALUES ?limit {1000 1000 2000 'INF'^^xsd:double 'bad'^^xsd:double -1 UNDEF}
+					    ?s <urn:location> ?context FILTER(%s) }
+					  UNION { VALUES ?s {<urn:branch>} }
+					} ORDER BY ?s
+					""".formatted(distance), List.of(branch, NEAR, NEAR, NEAR, OTHER));
+		} finally {
+			repository.shutDown();
+		}
+	}
+
+	@Test
+	void datasetLookupsKeepCustomInterpreterOverrides() throws Exception {
+		var invocations = new AtomicInteger();
+		var sail = new LuceneSail() {
+			@Override
+			protected Collection<SearchQueryInterpreter> getSearchQueryInterpreters() {
+				return List.of(new DistanceQuerySpecBuilder(getLuceneIndex()) {
+					@Override
+					public void process(TupleExpr expression, BindingSet bindings,
+							Collection<SearchQueryEvaluator> results) {
+						invocations.incrementAndGet();
+						super.process(expression, bindings, results);
+					}
+				});
+			}
+		};
+		var repository = mappedGeometryRepository(sail, new MemoryStore(), new RecordingIndex(),
+				TupleFunctionEvaluationMode.TRIPLE_SOURCE, new TupleFunctionRegistry());
+		try (var connection = repository.getConnection()) {
+			var point = Values.literal("POINT(0 0)", CoreDatatype.GEO.WKT_LITERAL);
+			connection.add(NEAR, SOURCE_LOCATION, point, Values.iri("urn:g1"));
+			connection.add(FAR, SOURCE_LOCATION, point, Values.iri("urn:g2"));
+			assertSubjects(connection, "FROM <urn:g1> WHERE { ?s <urn:location> ?wkt FILTER(" + DISTANCE + ") }",
+					List.of(NEAR));
+			assertEquals(1, invocations.get());
+		} finally {
+			repository.shutDown();
+		}
+	}
+
+	@Test
+	void unsupportedSpatialRelationKeepsItsScalarFilter() throws Exception {
+		var repository = mappedGeometryRepository(new RecordingIndex(),
+				TupleFunctionEvaluationMode.TRIPLE_SOURCE, new TupleFunctionRegistry());
+		try (var connection = repository.getConnection()) {
+			addGeometries(connection, LOCATION);
+			assertSubjects(connection, """
+					WHERE {
+						VALUES ?shape { 'POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'^^geo:wktLiteral }
+						?s <urn:location> ?wkt FILTER(geof:sfContains(?shape, ?wkt))
+					}
+					""", List.of(NEAR));
+		} finally {
+			repository.shutDown();
+		}
+	}
+
+	@Test
+	void indexedSpatialRelationsUseTheOriginalArgumentOrderAndIndividualGeometries() throws Exception {
+		var repository = mappedGeometryRepository(new RecordingIndex(),
+				TupleFunctionEvaluationMode.TRIPLE_SOURCE, new TupleFunctionRegistry());
+		try (var connection = repository.getConnection()) {
+			String polygon = "POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))";
+			var inside = Values.literal("POINT(0 0)", CoreDatatype.GEO.WKT_LITERAL);
+			connection.add(NEAR, LOCATION, Values.literal(polygon, CoreDatatype.GEO.WKT_LITERAL));
+			connection.add(FAR, LOCATION, inside);
+			connection.add(FAR, LOCATION, Values.literal("POINT(10 10)", CoreDatatype.GEO.WKT_LITERAL));
+			String body = "WHERE { VALUES ?point { 'POINT(0 0)'^^geo:wktLiteral } ?s <urn:location> ?wkt FILTER(%s) }";
+			assertSubjects(connection, body.formatted("geof:sfWithin(?point, ?wkt)") + " ORDER BY ?s",
+					List.of(FAR, NEAR));
+			assertSubjects(connection, body.formatted("geof:sfDisjoint(?point, ?wkt)"), List.of(FAR));
+		} finally {
+			repository.shutDown();
+		}
+	}
+
+	private static void assertSubjects(RepositoryConnection connection, String body, List<IRI> expected) {
+		try (var rows = connection.prepareTupleQuery(PREFIXES + "SELECT ?s " + body).evaluate()) {
+			assertEquals(expected, rows.stream().map(row -> row.getValue("s")).toList(), body);
+		}
+	}
 
 	@TestFactory
 	Stream<DynamicTest> mappedGeometryFiltersPreserveMandatoryInputs() {
@@ -259,11 +394,15 @@ public class LuceneGeoTest {
 
 	private static SailRepository mappedGeometryRepository(MemoryStore base, RecordingIndex index,
 			TupleFunctionEvaluationMode mode, TupleFunctionRegistry registry) throws Exception {
+		return mappedGeometryRepository(new LuceneSail(), base, index, mode, registry);
+	}
+
+	private static SailRepository mappedGeometryRepository(LuceneSail sail, MemoryStore base, RecordingIndex index,
+			TupleFunctionEvaluationMode mode, TupleFunctionRegistry registry) throws Exception {
 		Properties parameters = new Properties();
 		parameters.setProperty(LuceneSail.LUCENE_RAMDIR_KEY, "true");
 		parameters.setProperty(LuceneSail.WKT_FIELDS, LOCATION.stringValue());
 		index.initialize(parameters);
-		LuceneSail sail = new LuceneSail();
 		sail.setBaseSail(base);
 		sail.setLuceneIndex(index);
 		sail.setEvaluationMode(mode);

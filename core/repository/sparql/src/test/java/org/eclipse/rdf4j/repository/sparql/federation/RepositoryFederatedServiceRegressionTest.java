@@ -429,6 +429,100 @@ class RepositoryFederatedServiceRegressionTest {
 	}
 
 	@Test
+	void nativeIndependentFallbackLeavesCallerReadsOutsideTheInvocation() throws Exception {
+		for (boolean subquery : List.of(false, true)) {
+			for (boolean equalInputs : List.of(false, true)) {
+				Harness harness = new Harness(false);
+				if (!subquery) {
+					harness.service.setBoundJoinBlockSize(1);
+				}
+				String pattern = "?person <urn:test:p> ?id";
+				String body = subquery ? "{ SELECT ?person ?id WHERE { " + pattern + " } }" : pattern;
+				Service service = parsedService(body + " FILTER(?gate = \"allow\")");
+				BindingSet first = binding("gate", VF.createLiteral("allow"));
+				BindingSet second = binding("gate", VF.createLiteral(equalInputs ? "allow" : "deny"));
+				when(harness.query.evaluate()).thenAnswer(invocation -> tupleResult(List.of()));
+
+				assertEquals(List.of(), evaluate(harness.service, service, List.of(first, second)));
+				verify(harness.query).evaluate();
+				verify(harness.query, never()).setBinding(anyString(), any(Value.class));
+				ArgumentCaptor<String> source = ArgumentCaptor.forClass(String.class);
+				verify(harness.connection).prepareTupleQuery(any(QueryLanguage.class), source.capture(),
+						nullable(String.class));
+				assertTrue(!source.getValue().contains("__rowIdx"), source.getValue());
+			}
+		}
+	}
+
+	@Test
+	void serializedScalarRequestsOmitAnEqualIndependentlyFixedAssignment() throws Exception {
+		Harness harness = new Harness();
+		Service service = parsedService("BIND(<urn:a> AS ?x) BIND(1 AS ?result)");
+		BindingSet input = binding("x", VF.createIRI("urn:a"));
+		BindingSet result = binding("x", VF.createIRI("urn:a"), "result", VF.createLiteral(1));
+		when(harness.query.evaluate()).thenAnswer(invocation -> tupleResult(List.of(result)));
+		BooleanQuery ask = mock(BooleanQuery.class);
+		when(harness.connection.prepareBooleanQuery(any(QueryLanguage.class), anyString(), nullable(String.class)))
+				.thenReturn(ask);
+		when(ask.evaluate()).thenReturn(true);
+
+		assertEquals(List.of(result), collect(harness.service.select(service, Set.of("result"), input, null)));
+		assertTrue(harness.service.ask(service, input, null));
+		assertRequestOmitsValues(harness);
+		verify(ask).evaluate();
+	}
+
+	@Test
+	void serializedBatchKeepsEachAliasOfAnIndependentlyFixedOutput() throws Exception {
+		Harness harness = new Harness();
+		Object scope = new Object();
+		harness.service.setBNodeIdentityScope(scope);
+		harness.service.setBlankNodeReferencesSupported(true);
+		harness.service.setCanonicalBNodeIDsSupported(true);
+		Value parameter = canonicalAlias(scope);
+		Value first = canonicalAlias(scope);
+		Value second = canonicalAlias(scope);
+		Service service = service(new StatementPattern(Var.of("id", parameter).withApiInputOrigin(),
+				Var.of("p", PREDICATE, true, true), Var.of("person")), "?id <urn:test:p> ?person", false);
+		service.setPreparedInputBindings(Map.of("id", parameter));
+		Value person = VF.createIRI("urn:person");
+		when(harness.query.evaluate())
+				.thenAnswer(invocation -> tupleResult(List.of(binding("id", VF.createBNode("canonical"),
+						"person", person))));
+
+		List<BindingSet> result = evaluate(harness.service, service,
+				List.of(binding("id", first), binding("id", second)));
+
+		assertEquals(2, result.size());
+		assertSame(first, result.get(0).getValue("id"));
+		assertSame(second, result.get(1).getValue("id"));
+		assertEquals(person, result.get(0).getValue("person"));
+		assertEquals(person, result.get(1).getValue("person"));
+		verify(harness.query).evaluate();
+	}
+
+	@Test
+	void independentlyFixedServiceOutputDoesNotRemoveItsDynamicSelector() throws Exception {
+		for (boolean serialized : List.of(false, true)) {
+			Harness harness = new Harness(serialized);
+			Service service = parsedService("BIND(<urn:different> AS ?endpoint) BIND(1 AS ?result)");
+			service.setServiceRef(Var.of("endpoint"));
+			BindingSet input = binding("endpoint", VF.createIRI("urn:actual"));
+			BindingSet result = binding("endpoint", VF.createIRI("urn:different"), "result", VF.createLiteral(1));
+			when(harness.query.evaluate()).thenAnswer(invocation -> tupleResult(List.of(result)));
+			BooleanQuery ask = mock(BooleanQuery.class);
+			when(harness.connection.prepareBooleanQuery(any(QueryLanguage.class), anyString(), nullable(String.class)))
+					.thenReturn(ask);
+			when(ask.evaluate()).thenReturn(true);
+
+			assertEquals(List.of(), collect(harness.service.select(service, Set.of("result"), input, null)));
+			assertTrue(!harness.service.ask(service, input, null));
+			verify(harness.query).evaluate();
+			verify(ask).evaluate();
+		}
+	}
+
+	@Test
 	void serializedScalarTransportDoesNotAlsoApplyNativeParameters() throws Exception {
 		Harness harness = new Harness();
 		TupleQueryResult remote = tupleResult(List.of());

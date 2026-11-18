@@ -25,8 +25,10 @@ import org.eclipse.rdf4j.model.base.CoreDatatype;
 import org.eclipse.rdf4j.model.datatypes.XMLDatatypeUtil;
 import org.eclipse.rdf4j.model.vocabulary.GEOF;
 import org.eclipse.rdf4j.query.BindingSet;
+import org.eclipse.rdf4j.query.Dataset;
 import org.eclipse.rdf4j.query.algebra.Compare;
 import org.eclipse.rdf4j.query.algebra.Compare.CompareOp;
+import org.eclipse.rdf4j.query.algebra.Distinct;
 import org.eclipse.rdf4j.query.algebra.Extension;
 import org.eclipse.rdf4j.query.algebra.ExtensionElem;
 import org.eclipse.rdf4j.query.algebra.Filter;
@@ -37,6 +39,7 @@ import org.eclipse.rdf4j.query.algebra.SingletonSet;
 import org.eclipse.rdf4j.query.algebra.StatementPattern;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.TupleFunctionCall;
+import org.eclipse.rdf4j.query.algebra.Union;
 import org.eclipse.rdf4j.query.algebra.ValueConstant;
 import org.eclipse.rdf4j.query.algebra.ValueExpr;
 import org.eclipse.rdf4j.query.algebra.Var;
@@ -44,6 +47,7 @@ import org.eclipse.rdf4j.query.algebra.evaluation.function.FunctionRegistry;
 import org.eclipse.rdf4j.query.algebra.evaluation.function.TupleFunctionRegistry;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractQueryModelVisitor;
 import org.eclipse.rdf4j.sail.SailException;
+import org.eclipse.rdf4j.sail.lucene.SearchQueryBindingResolver.GeometryScope;
 
 public class DistanceQuerySpecBuilder implements SearchQueryInterpreter {
 
@@ -65,6 +69,7 @@ public class DistanceQuerySpecBuilder implements SearchQueryInterpreter {
 	public void process(TupleExpr tupleExpr, BindingSet bindings, final Collection<SearchQueryEvaluator> results)
 			throws SailException {
 
+		Dataset dataset = SearchQueryBindingResolver.currentReadDataset();
 		SearchQueryBindingResolver resolver = new SearchQueryBindingResolver(tupleExpr, bindings);
 		boolean runtimeDistanceAvailable = (useNativeTupleFunctions || tupleFunctions != null
 				&& tupleFunctions.get(LuceneSailSchema.WITHIN_DISTANCE.stringValue()).isPresent())
@@ -142,17 +147,21 @@ public class DistanceQuerySpecBuilder implements SearchQueryInterpreter {
 					DistanceQuerySpec spec = specs.get(objectVarName);
 					if (spec != null && SearchQueryBindingResolver.isRequiredGeometryInput(sp, spec.getFilter(),
 							spec.getDistanceFunctionCall().getParentNode())) {
-						spec.setGeometryPattern(sp);
-						if (spec.isEvaluable()) {
-							results.add(spec);
+						var scope = SearchQueryBindingResolver.geometryScope(sp, dataset);
+						if (scope == null) {
+							return;
+						}
+						spec.setGeometryPattern(sp, scope.context());
+						if (spec.isEvaluable() && !scope.needsActiveGraph()) {
+							results.add(scope.lookup(spec, spec::scopedTo));
 							specs.remove(objectVarName);
-						} else {
+						} else if (runtimeDistanceAvailable) {
 							List<ValueExpr> functionArgs = spec.getDistanceFunctionCall().getArgs();
 							List<ValueExpr> arguments = resolver.runtimeArguments(sp, spec.getFilter(),
 									List.of(functionArgs.get(0), spec.getDistanceExpr(), functionArgs.get(2)));
 							if (!arguments.isEmpty() && (sp.getContextVar() == null || !sp.getContextVar().hasValue()
 									|| sp.getContextVar().getValue() instanceof Resource)) {
-								TupleExpr search = runtimeSearch(spec, sp, arguments);
+								TupleExpr search = runtimeSearch(spec, sp, arguments, scope);
 								runtimeReplacements.add(() -> AbstractSearchQueryEvaluator
 										.replaceKeepingScope(spec.removeQueryPatterns(), search));
 								specs.remove(objectVarName);
@@ -166,7 +175,45 @@ public class DistanceQuerySpecBuilder implements SearchQueryInterpreter {
 		runtimeReplacements.forEach(Runnable::run);
 	}
 
-	private static TupleExpr runtimeSearch(DistanceQuerySpec spec, StatementPattern pattern, List<ValueExpr> args) {
+	private static TupleExpr runtimeSearch(DistanceQuerySpec spec, StatementPattern pattern, List<ValueExpr> args,
+			GeometryScope scope) {
+		TupleExpr search;
+		if (scope.mergedDefaultGraphs().isEmpty()) {
+			search = runtimeLookup(spec, pattern.clone(), args, scope.context());
+		} else {
+			// Merge equal geometry rows within each input solution, preserving duplicates in the caller's bag.
+			List<Var> contexts = scope.mergedDefaultGraphs();
+			search = Distinct.perInput(mergedRuntimeLookups(spec, pattern, args, contexts, 0, contexts.size()));
+		}
+		Lateral lookup = new Lateral(new SingletonSet(), search);
+		lookup.setVariableScopeChange(false);
+		return lookup;
+	}
+
+	private static TupleExpr mergedRuntimeLookups(DistanceQuerySpec spec, StatementPattern pattern,
+			List<ValueExpr> args, List<Var> contexts, int start, int end) {
+		if (end - start == 1) {
+			Var context = contexts.get(start);
+			String contextName = context.getName();
+			while (contextName.equals(pattern.getSubjectVar().getName())
+					|| contextName.equals(pattern.getPredicateVar().getName())
+					|| contextName.equals(pattern.getObjectVar().getName())) {
+				contextName += "_";
+			}
+			// A rejected operand falls back to the same physical graph as this index lookup.
+			StatementPattern scoped = new StatementPattern(pattern.getScope(), pattern.getSubjectVar().clone(),
+					pattern.getPredicateVar().clone(), pattern.getObjectVar().clone(),
+					Var.of(contextName, context.getValue(), true, true));
+			scoped.setVariableScopeChange(pattern.isVariableScopeChange());
+			return runtimeLookup(spec, scoped, args, context);
+		}
+		int middle = start + (end - start) / 2;
+		return new Union(mergedRuntimeLookups(spec, pattern, args, contexts, start, middle),
+				mergedRuntimeLookups(spec, pattern, args, contexts, middle, end));
+	}
+
+	private static TupleFunctionCall runtimeLookup(DistanceQuerySpec spec, StatementPattern pattern,
+			List<ValueExpr> args, Var context) {
 		TupleFunctionCall search = new TupleFunctionCall();
 		search.setURI(LuceneSailSchema.WITHIN_DISTANCE.stringValue());
 		search.addArgs(args.stream().map(ValueExpr::clone).toList());
@@ -176,7 +223,6 @@ public class DistanceQuerySpecBuilder implements SearchQueryInterpreter {
 			search.addArg(new ValueConstant(LuceneSailSchema.DISTANCE));
 			search.addResultVar(Var.of(spec.getDistanceVar()));
 		}
-		Var context = spec.getContextVar();
 		if (context != null) {
 			if (context.hasValue()) {
 				search.addArg(new ValueConstant(context.getValue()));
@@ -186,7 +232,7 @@ public class DistanceQuerySpecBuilder implements SearchQueryInterpreter {
 			}
 		}
 
-		TupleExpr scalarInput = pattern.clone();
+		TupleExpr scalarInput = pattern;
 		ValueExpr distance = new FunctionCall(GEOF.DISTANCE.stringValue(), args.get(0).clone(),
 				pattern.getObjectVar().clone(), args.get(2).clone());
 		if (spec.getDistanceVar() != null) {
@@ -195,11 +241,10 @@ public class DistanceQuerySpecBuilder implements SearchQueryInterpreter {
 		}
 		Filter scalar = new Filter(scalarInput, new Compare(distance, args.get(1).clone(), CompareOp.LT));
 		scalar.setConditionBindingScope(Filter.ConditionBindingScope.ALL);
-		search.setFallback(scalar, new FunctionCall(DistanceQueryOperandCheck.URI, args), context == null);
-		// Keep the lookup after its input rows and retain the statement pattern's incoming binding frame.
-		Lateral lookup = new Lateral(new SingletonSet(), search);
-		lookup.setVariableScopeChange(false);
-		return lookup;
+		search.setFallback(scalar,
+				new FunctionCall(DistanceQueryOperandCheck.URI, args.stream().map(ValueExpr::clone).toList()),
+				context == null);
+		return search;
 	}
 
 	static boolean isIndexableDistance(double distance) {

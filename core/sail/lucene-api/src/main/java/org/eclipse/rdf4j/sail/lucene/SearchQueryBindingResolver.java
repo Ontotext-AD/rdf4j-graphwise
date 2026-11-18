@@ -16,9 +16,14 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Function;
 
+import org.eclipse.rdf4j.model.Resource;
 import org.eclipse.rdf4j.model.Value;
+import org.eclipse.rdf4j.model.vocabulary.RDF4J;
+import org.eclipse.rdf4j.model.vocabulary.SESAME;
 import org.eclipse.rdf4j.query.BindingSet;
+import org.eclipse.rdf4j.query.Dataset;
 import org.eclipse.rdf4j.query.algebra.Difference;
 import org.eclipse.rdf4j.query.algebra.Extension;
 import org.eclipse.rdf4j.query.algebra.ExtensionElem;
@@ -34,6 +39,7 @@ import org.eclipse.rdf4j.query.algebra.UnaryTupleOperator;
 import org.eclipse.rdf4j.query.algebra.ValueConstant;
 import org.eclipse.rdf4j.query.algebra.ValueExpr;
 import org.eclipse.rdf4j.query.algebra.Var;
+import org.eclipse.rdf4j.query.algebra.evaluation.QueryContext;
 import org.eclipse.rdf4j.query.algebra.evaluation.util.QueryEvaluationUtility;
 import org.eclipse.rdf4j.query.algebra.helpers.FilterBindingScope;
 import org.eclipse.rdf4j.query.algebra.helpers.QueryAlgebraBindingAnalysis;
@@ -41,6 +47,7 @@ import org.eclipse.rdf4j.query.algebra.helpers.TupleExprs;
 
 /** Resolves a search operand at its own evaluator position, respecting preceding local assignments and scopes. */
 final class SearchQueryBindingResolver {
+	private static final String READ_DATASET = SearchQueryBindingResolver.class.getName() + ".readDataset";
 	private final QueryAlgebraBindingAnalysis analysis;
 
 	SearchQueryBindingResolver(TupleExpr expression, BindingSet parameters) {
@@ -61,6 +68,88 @@ final class SearchQueryBindingResolver {
 		return input.bindingDomainKnown() && input.guaranteedNames().contains(variable.getName())
 				? input.fixedValues().get(variable.getName())
 				: null;
+	}
+
+	static void setReadDataset(QueryContext context, Dataset dataset) {
+		context.setAttribute(READ_DATASET, dataset);
+	}
+
+	static Dataset currentReadDataset() {
+		QueryContext context = QueryContext.getQueryContext();
+		return context == null ? null : context.getAttribute(READ_DATASET);
+	}
+
+	/** Selects contexts for an indexed geometry lookup, or defers active graph selection to the evaluator. */
+	record GeometryScope(Var context, List<Var> mergedDefaultGraphs, boolean needsActiveGraph) {
+		GeometryScope(Var context, boolean needsActiveGraph) {
+			this(context, List.of(), needsActiveGraph);
+		}
+
+		SearchQueryEvaluator lookup(SearchQueryEvaluator query, Function<Var, SearchQueryEvaluator> scopedLookup) {
+			return mergedDefaultGraphs.isEmpty() ? query
+					: new MergedDefaultGraphQuery(query, mergedDefaultGraphs.stream().map(scopedLookup).toList());
+		}
+	}
+
+	/** Returns null when the index cannot represent this statement pattern's graph selection. */
+	static GeometryScope geometryScope(StatementPattern pattern, Dataset dataset) {
+		Graph active = null;
+		for (QueryModelNode node = pattern.getParentNode(); node != null; node = node.getParentNode()) {
+			if (node instanceof Service) {
+				return null;
+			}
+			if (active == null && node instanceof Graph graph) {
+				active = graph;
+			}
+		}
+		Var context = pattern.getContextVar();
+		if (active != null) {
+			if (context != null || pattern.getScope() != StatementPattern.Scope.DEFAULT_CONTEXTS) {
+				return null;
+			}
+			// GRAPH itself checks dataset membership. A variable graph or a default-graph alias needs its
+			// physical context from the evaluator, unless the dataset admits exactly one physical named graph.
+			Var name = active.getGraphName();
+			if (isPhysicalContext(name.getValue())) {
+				return new GeometryScope(name, false);
+			}
+			if (!name.hasValue() && dataset != null && dataset.getNamedGraphResources().size() == 1) {
+				Resource graph = dataset.getNamedGraphResources().iterator().next();
+				if (isPhysicalContext(graph)) {
+					return new GeometryScope(fixedContext(graph), false);
+				}
+			}
+			return new GeometryScope(null, true);
+		}
+		boolean restricted = dataset != null && (dataset.isExplicitReadDataset()
+				|| !dataset.getDefaultGraphResources().isEmpty() || !dataset.getNamedGraphResources().isEmpty());
+		boolean named = pattern.getScope() == StatementPattern.Scope.NAMED_CONTEXTS;
+		if (context != null && (context.hasValue() ? !isPhysicalContext(context.getValue()) : !named)
+				|| named && context == null) {
+			return null;
+		}
+		if (!restricted) {
+			return new GeometryScope(context, false);
+		}
+		Set<Resource> selected = named ? dataset.getNamedGraphResources() : dataset.getDefaultGraphResources();
+		if (context != null) {
+			return context.hasValue() && selected.contains(context.getValue()) ? new GeometryScope(context, false)
+					: null;
+		}
+		if (selected.isEmpty() || !selected.stream().allMatch(SearchQueryBindingResolver::isPhysicalContext)) {
+			return null;
+		}
+		List<Var> contexts = selected.stream().map(SearchQueryBindingResolver::fixedContext).toList();
+		return contexts.size() == 1 ? new GeometryScope(contexts.getFirst(), false)
+				: new GeometryScope(null, contexts, false);
+	}
+
+	private static Var fixedContext(Resource graph) {
+		return Var.of("context", graph, true, true);
+	}
+
+	private static boolean isPhysicalContext(Value graph) {
+		return graph instanceof Resource && !RDF4J.NIL.equals(graph) && !SESAME.NIL.equals(graph);
 	}
 
 	static boolean isRequiredGeometryInput(StatementPattern pattern, Filter filter, QueryModelNode functionParent) {
@@ -122,11 +211,6 @@ final class SearchQueryBindingResolver {
 	}
 
 	List<ValueExpr> runtimeArguments(StatementPattern pattern, Filter filter, List<ValueExpr> operands) {
-		for (QueryModelNode ancestor = filter.getParentNode(); ancestor != null; ancestor = ancestor.getParentNode()) {
-			if (ancestor instanceof Service || ancestor instanceof Graph && pattern.getContextVar() != null) {
-				return List.of();
-			}
-		}
 		var input = analysis.contextAt(pattern);
 		if (!input.bindingDomainKnown()) {
 			return List.of();

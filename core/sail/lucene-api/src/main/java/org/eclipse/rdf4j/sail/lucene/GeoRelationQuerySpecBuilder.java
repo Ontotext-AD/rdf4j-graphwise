@@ -19,8 +19,8 @@ import java.util.Map;
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.Literal;
 import org.eclipse.rdf4j.model.Value;
-import org.eclipse.rdf4j.model.vocabulary.GEOF;
 import org.eclipse.rdf4j.query.BindingSet;
+import org.eclipse.rdf4j.query.Dataset;
 import org.eclipse.rdf4j.query.algebra.ExtensionElem;
 import org.eclipse.rdf4j.query.algebra.Filter;
 import org.eclipse.rdf4j.query.algebra.FunctionCall;
@@ -44,6 +44,7 @@ public class GeoRelationQuerySpecBuilder implements SearchQueryInterpreter {
 	public void process(TupleExpr tupleExpr, BindingSet bindings, final Collection<SearchQueryEvaluator> results)
 			throws SailException {
 
+		Dataset dataset = SearchQueryBindingResolver.currentReadDataset();
 		SearchQueryBindingResolver resolver = new SearchQueryBindingResolver(tupleExpr, bindings);
 
 		tupleExpr.visit(new AbstractQueryModelVisitor<SailException>() {
@@ -52,7 +53,7 @@ public class GeoRelationQuerySpecBuilder implements SearchQueryInterpreter {
 
 			@Override
 			public void meet(FunctionCall f) throws SailException {
-				if (f.getURI().startsWith(GEOF.NAMESPACE)) {
+				if (index.supportsGeoRelation(f.getURI())) {
 					List<ValueExpr> args = f.getArgs();
 					if (args.size() != 2) {
 						return;
@@ -100,9 +101,13 @@ public class GeoRelationQuerySpecBuilder implements SearchQueryInterpreter {
 					GeoRelationQuerySpec spec = specs.get(objectVarName);
 					if (spec != null && SearchQueryBindingResolver.isRequiredGeometryInput(sp, spec.getFilter(),
 							spec.getFunctionParent())) {
+						var scope = SearchQueryBindingResolver.geometryScope(sp, dataset);
+						if (scope == null || scope.needsActiveGraph()) {
+							return;
+						}
 						specs.remove(objectVarName);
-						spec.setGeometryPattern(sp);
-						results.add(spec);
+						spec.setGeometryPattern(sp, scope.context());
+						results.add(scope.lookup(spec, spec::scopedTo));
 					}
 				}
 			}

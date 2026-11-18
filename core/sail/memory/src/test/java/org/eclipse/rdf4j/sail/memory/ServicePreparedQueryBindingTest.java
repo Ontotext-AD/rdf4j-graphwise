@@ -1047,6 +1047,42 @@ class ServicePreparedQueryBindingTest {
 	}
 
 	@Test
+	void equalCallerBindingsJoinIndependentlyFixedServiceOutputs() {
+		assertAll(List.of(false, true).stream().map(sparql -> () -> {
+			try (Harness harness = new Harness(sparql)) {
+				assertAll(List.of(false, true).stream().map(silent -> () -> {
+					Service service = preparedService("BIND(<urn:a> AS ?x) BIND(\"remote\" AS ?result)", Map.of(),
+							silent);
+					MapBindingSet compatible = new MapBindingSet();
+					compatible.addBinding("x", VF.createIRI("urn:a"));
+					MapBindingSet incompatible = new MapBindingSet();
+					incompatible.addBinding("x", VF.createIRI("urn:b"));
+					MapBindingSet expected = new MapBindingSet();
+					expected.addBinding("x", VF.createIRI("urn:a"));
+					expected.addBinding("result", VF.createLiteral("remote"));
+					try (var rows = harness.endpoint.select(service, Set.of("result"), compatible, null)) {
+						assertThat(rows.hasNext()).isTrue();
+						assertThat(rows.next()).isEqualTo(expected);
+						assertThat(rows.hasNext()).isFalse();
+					}
+					assertThat(harness.endpoint.ask(service, compatible, null)).isTrue();
+					assertThat(harness.endpoint.ask(service, incompatible, null)).isFalse();
+					List<BindingSet> actual = new ArrayList<>();
+					try (var rows = harness.endpoint.evaluate(service,
+							new CloseableIteratorIteration<>(List.<BindingSet>of(compatible, incompatible, compatible)
+									.iterator()),
+							null)) {
+						while (rows.hasNext()) {
+							actual.add(rows.next());
+						}
+					}
+					assertThat(actual).containsExactly(expected, expected);
+				}));
+			}
+		}));
+	}
+
+	@Test
 	void fixedOutputOmissionKeepsImplicitPropagatedNullableAndWholeRowReadsFailClosed() {
 		List<String> bodies = List.of(
 				"BIND(?x AS ?copied) BIND(?copied AS ?before) BIND(<urn:a> AS ?x) ?x <urn:p> ?o",

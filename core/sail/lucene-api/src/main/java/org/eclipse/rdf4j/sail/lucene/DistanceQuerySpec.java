@@ -129,6 +129,10 @@ public class DistanceQuerySpec extends AbstractSearchQueryEvaluator {
 	}
 
 	public void setGeometryPattern(StatementPattern sp) {
+		setGeometryPattern(sp, sp.getContextVar());
+	}
+
+	void setGeometryPattern(StatementPattern sp, Var context) {
 		if (sp.getSubjectVar().hasValue()) {
 			throw new IllegalArgumentException("Subject cannot be bound: " + sp);
 		}
@@ -143,7 +147,7 @@ public class DistanceQuerySpec extends AbstractSearchQueryEvaluator {
 		}
 		this.geoStatement = sp;
 		this.subjectVar = sp.getSubjectVar().getName();
-		this.contextVar = sp.getContextVar();
+		this.contextVar = context;
 		this.geoProperty = (IRI) sp.getPredicateVar().getValue();
 	}
 
@@ -153,6 +157,14 @@ public class DistanceQuerySpec extends AbstractSearchQueryEvaluator {
 
 	public Var getContextVar() {
 		return contextVar;
+	}
+
+	DistanceQuerySpec scopedTo(Var context) {
+		DistanceQuerySpec lookup = new DistanceQuerySpec(distanceFunction, distanceExpr, distanceVar, filter, distance);
+		lookup.setFrom(from);
+		lookup.setUnits(units);
+		lookup.setGeometryPattern(geoStatement, context);
+		return lookup;
 	}
 
 	public IRI getGeoProperty() {

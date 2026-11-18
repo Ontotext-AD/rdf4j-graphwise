@@ -232,7 +232,7 @@ public class TupleExprs {
 			if (current instanceof Slice) {
 				return true;
 			}
-			if (current instanceof Distinct || current instanceof Reduced) {
+			if (current instanceof Distinct distinct && !distinct.isInputScoped() || current instanceof Reduced) {
 				TupleExpr argument = ((UnaryTupleOperator) current).getArg();
 				QueryAlgebraBindingAnalysis.ReadOnlyContext modifierInput = scopedAnalysis.contextAt(current);
 				QueryAlgebraBindingAnalysis.ReadOnlyContext argumentInput = scopedAnalysis.childInput(current, argument,

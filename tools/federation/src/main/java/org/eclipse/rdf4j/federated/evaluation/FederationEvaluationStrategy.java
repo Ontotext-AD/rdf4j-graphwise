@@ -2135,7 +2135,10 @@ public class FederationEvaluationStrategy extends StrictEvaluationStrategy {
 			result = evaluateAtStatementSources(preparedQuery, tripleRefJoinGroup.getStatementSources(),
 					tripleRefJoinGroup.getQueryInfo());
 
-			return result;
+			// The rendered query inlines bound terms, so the endpoint omits those columns from its results.
+			return bindings.isEmpty() && !QueryAlgebraUtil.hasExplicitNullBindings(bindings)
+					? result
+					: new InsertBindingsIteration(result, bindings);
 		} catch (Throwable t) {
 			if (result != null) {
 				result.close();

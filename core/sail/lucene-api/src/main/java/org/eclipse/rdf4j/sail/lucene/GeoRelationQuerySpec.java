@@ -35,6 +35,8 @@ public class GeoRelationQuerySpec extends AbstractSearchQueryEvaluator {
 
 	private StatementPattern geoStatement;
 
+	private Var contextVar;
+
 	private Filter filter;
 
 	public void setRelation(String relation) {
@@ -70,6 +72,10 @@ public class GeoRelationQuerySpec extends AbstractSearchQueryEvaluator {
 	}
 
 	public void setGeometryPattern(StatementPattern sp) {
+		setGeometryPattern(sp, sp.getContextVar());
+	}
+
+	void setGeometryPattern(StatementPattern sp, Var context) {
 		if (sp.getSubjectVar().hasValue()) {
 			throw new IllegalArgumentException("Subject cannot be bound: " + sp);
 		}
@@ -80,6 +86,7 @@ public class GeoRelationQuerySpec extends AbstractSearchQueryEvaluator {
 			throw new IllegalArgumentException("Object cannot be bound: " + sp);
 		}
 		this.geoStatement = sp;
+		this.contextVar = context;
 	}
 
 	public String getSubjectVar() {
@@ -87,7 +94,18 @@ public class GeoRelationQuerySpec extends AbstractSearchQueryEvaluator {
 	}
 
 	public Var getContextVar() {
-		return geoStatement.getContextVar();
+		return contextVar;
+	}
+
+	GeoRelationQuerySpec scopedTo(Var context) {
+		GeoRelationQuerySpec lookup = new GeoRelationQuerySpec();
+		lookup.setRelation(relation);
+		lookup.setQueryGeometry(qshape);
+		lookup.setFunctionValueVar(valueVar);
+		lookup.setFunctionParent(functionParent);
+		lookup.setFilter(filter);
+		lookup.setGeometryPattern(geoStatement, context);
+		return lookup;
 	}
 
 	public IRI getGeoProperty() {

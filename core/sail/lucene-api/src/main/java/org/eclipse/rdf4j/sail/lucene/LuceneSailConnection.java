@@ -406,6 +406,7 @@ public class LuceneSailConnection extends NotifyingSailConnectionWrapper {
 			Dataset dataset, BindingSet bindings, boolean includeInferred) throws SailException {
 		QueryContext qctx = new QueryContext();
 		SearchIndexQueryContextInitializer.init(qctx, luceneIndex);
+		SearchQueryBindingResolver.setReadDataset(qctx, dataset);
 
 		final CloseableIteration<? extends BindingSet> iter;
 		qctx.begin();
@@ -502,7 +503,9 @@ public class LuceneSailConnection extends NotifyingSailConnectionWrapper {
 		// evaluate queries, generate binding sets, and remove queries
 		for (SearchQueryEvaluator query : queries) {
 			// evaluate the Lucene query and generate bindings
-			final Collection<BindingSet> bindingSets = luceneIndex.evaluate(query);
+			final Collection<BindingSet> bindingSets = query instanceof MergedDefaultGraphQuery merged
+					? merged.evaluate(luceneIndex)
+					: luceneIndex.evaluate(query);
 
 			final BindingSetAssignment bsa = new BindingSetAssignment();
 

@@ -12,14 +12,17 @@
 package org.eclipse.rdf4j.federated.evaluation;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 
+import org.eclipse.rdf4j.federated.FedXConfig;
 import org.eclipse.rdf4j.federated.FedXFactory;
 import org.eclipse.rdf4j.federated.algebra.ExclusiveStatement;
 import org.eclipse.rdf4j.federated.algebra.FilterExpr;
@@ -38,6 +41,7 @@ import org.eclipse.rdf4j.federated.structures.QueryType;
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.Value;
 import org.eclipse.rdf4j.model.util.Values;
+import org.eclipse.rdf4j.model.vocabulary.RDF;
 import org.eclipse.rdf4j.model.vocabulary.RDF4J;
 import org.eclipse.rdf4j.model.vocabulary.SESAME;
 import org.eclipse.rdf4j.query.BindingSet;
@@ -87,6 +91,7 @@ class FedXCapturedBoundJoinTest {
 				.withMembers(List.of(endpoint(LEFT, left, EndpointType.SparqlEndpoint, EndpointClassification.Remote),
 						endpoint(RIGHT, right, EndpointType.SparqlEndpoint, EndpointClassification.Remote),
 						endpoint(LOCAL, local, EndpointType.LocalStore, EndpointClassification.Local)))
+				.withConfig(new FedXConfig().withEnableTripleRefSupport(true))
 				.create();
 		federation.init();
 		var context = federation.getFederationContext();
@@ -102,6 +107,38 @@ class FedXCapturedBoundJoinTest {
 			}
 		} finally {
 			federation.shutDown();
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({ "o,false", "source,false", "o,true", "source,true" })
+	void tripleRefJoinGroupRestoresPreparedBinding(String column, boolean mixedSources) {
+		IRI sourcePredicate = Values.iri("urn:source");
+		var members = mixedSources ? List.of(left, right, local) : List.of(left, right);
+		for (var member : members) {
+			try (var connection = member.getConnection()) {
+				var factory = connection.getValueFactory();
+				var reifier = factory.createBNode();
+				connection.add(reifier, RDF.REIFIES, factory.createTripleTerm(A, PREDICATE, FIRST));
+				connection.add(reifier, sourcePredicate, SECOND);
+				var otherReifier = factory.createBNode();
+				connection.add(otherReifier, RDF.REIFIES, factory.createTripleTerm(B, PREDICATE, SECOND));
+				connection.add(otherReifier, sourcePredicate, FIRST);
+			}
+		}
+
+		try (var connection = federation.getConnection()) {
+			var query = connection.prepareTupleQuery("""
+					PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+					SELECT ?s ?o ?source WHERE {
+					  ?reifier rdf:reifies <<( ?s <urn:p> ?o )>> ;
+					           <urn:source> ?source .
+					}
+					""");
+			query.setBinding(column, column.equals("o") ? FIRST : SECOND);
+			assertThat(QueryResults.asList(query.evaluate()))
+					.extracting(row -> tuple(row.getValue("s"), row.getValue("o"), row.getValue("source")))
+					.containsExactlyElementsOf(Collections.nCopies(members.size(), tuple(A, FIRST, SECOND)));
 		}
 	}
 

@@ -338,13 +338,14 @@ public class RepositoryFederatedService implements FederatedService {
 		RepositoryConnection conn = suppliedConnection;
 		CloseableIteration<BindingSet> result = null;
 		try {
-			Service logical = service;
-			SPARQLQueries.ServiceRequest request = SPARQLQueries.prepareServiceRequest(service,
+			List<BindingSet> originals = List.of(original);
+			Service logical = withResolvedSelector(service, originals);
+			SPARQLQueries.ServiceRequest request = SPARQLQueries.prepareServiceRequest(logical,
 					List.of(), bnodeIdentityScope, blankNodeReferencesSupported, canonicalBNodeIDsSupported);
 			service = request.service();
 			SPARQLQueries.initializeServiceReferences(service);
-			TransportInput input = omitProvenFixedConflicts(original,
-					provenIndependentFixedOutputs(logical, service, List.of(original)));
+			TransportInput input = omitIndependentFixedOutputs(original,
+					provenIndependentFixedOutputs(logical, service, originals));
 			BindingSet outgoing = request.prepareRuntimeInput(input.bindings());
 			BindingSet queryBindings = relevantBindings(service, outgoing);
 			BindingSet resultBindings = original;
@@ -401,13 +402,14 @@ public class RepositoryFederatedService implements FederatedService {
 		BindingSet original = RemoteBNode.originalBindings(bindings);
 		RepositoryConnection conn = null;
 		try {
-			Service logical = service;
-			SPARQLQueries.ServiceRequest request = SPARQLQueries.prepareServiceRequest(service,
+			List<BindingSet> originals = List.of(original);
+			Service logical = withResolvedSelector(service, originals);
+			SPARQLQueries.ServiceRequest request = SPARQLQueries.prepareServiceRequest(logical,
 					List.of(), bnodeIdentityScope, blankNodeReferencesSupported, canonicalBNodeIDsSupported);
 			service = request.service();
 			SPARQLQueries.initializeServiceReferences(service);
-			TransportInput input = omitProvenFixedConflicts(original,
-					provenIndependentFixedOutputs(logical, service, List.of(original)));
+			TransportInput input = omitIndependentFixedOutputs(original,
+					provenIndependentFixedOutputs(logical, service, originals));
 			BindingSet outgoing = request.prepareRuntimeInput(input.bindings());
 			BindingSet queryBindings = relevantBindings(service, outgoing);
 			String queryString = service.getAskQueryString();
@@ -440,7 +442,7 @@ public class RepositoryFederatedService implements FederatedService {
 			}
 
 			boolean exists = query.evaluate();
-			return input.omitted().isEmpty() && exists;
+			return exists && !input.hasConflict();
 		} catch (RuntimeException failure) {
 			if (service.isSilent() && !QueryExecutionContext.isReplaySafepointFailure(failure)) {
 				return true;
@@ -560,11 +562,10 @@ public class RepositoryFederatedService implements FederatedService {
 		RepositoryConnection conn = null;
 		CloseableIteration<BindingSet> result = null;
 		BindingSet parameterIdentities = EmptyBindingSet.getInstance();
-		boolean omittedConflict = false;
 		boolean valuesTransportAttempted = false;
 		try (var active = allocation.activate()) {
-			Service logical = service;
-			SPARQLQueries.ServiceRequest request = SPARQLQueries.prepareServiceRequest(service, List.of(),
+			Service logical = withResolvedSelector(service, originals);
+			SPARQLQueries.ServiceRequest request = SPARQLQueries.prepareServiceRequest(logical, List.of(),
 					bnodeIdentityScope, blankNodeReferencesSupported, canonicalBNodeIDsSupported);
 			service = request.service();
 			parameterIdentities = request.parameterIdentities();
@@ -572,9 +573,10 @@ public class RepositoryFederatedService implements FederatedService {
 			Map<String, Value> independentFixed = provenIndependentFixedOutputs(logical, service, originals);
 			List<BindingSet> queryInputs = new ArrayList<>(originals.size());
 			List<BindingSet> transported = new ArrayList<>(originals.size());
+			boolean inputOmitted = false;
 			for (BindingSet original : originals) {
-				TransportInput input = omitProvenFixedConflicts(original, independentFixed);
-				omittedConflict |= !input.omitted().isEmpty();
+				TransportInput input = omitIndependentFixedOutputs(original, independentFixed);
+				inputOmitted |= !input.omitted().isEmpty();
 				queryInputs.add(input.bindings());
 				transported.add(request.prepareRuntimeInput(input.bindings()));
 			}
@@ -586,8 +588,7 @@ public class RepositoryFederatedService implements FederatedService {
 			ServiceBindingScopes scopes = localJoin || scalar
 					? nativeBindingScopes(service, transported, request.nativeParameters())
 					: null;
-			NativeInputPlan nativePlan = localJoin ? nativeInputPlan(service, scopes) : null;
-			if (localJoin && nativePlan.readNames().isEmpty()) {
+			if (localJoin && nativeInputPlan(service, scopes).readNames().isEmpty()) {
 				return evaluateOnceAndJoinLocally(service, originals, baseUri, parameterIdentities);
 			}
 			Set<String> outputNames = remoteOutputBindingNames(service);
@@ -599,6 +600,14 @@ public class RepositoryFederatedService implements FederatedService {
 			projectionVars.removeAll(assuredInputNames);
 			if (!scalar || !scopes.independentNames().isEmpty()) {
 				conn = useFreshConnection ? freshConnection() : getConnection();
+			}
+			if (localJoin) {
+				// Retain the selected connection across the overridable select call. The independent request
+				// still uses an empty caller mapping, even on a connection that accepts native inputs.
+				RepositoryConnection localConnection = conn;
+				conn = null;
+				return evaluateOnceAndJoinLocally(service, originals, baseUri, parameterIdentities, localConnection,
+						EmptyBindingSet.getInstance(), outputNames);
 			}
 			boolean serializedBindings = conn != null && conn.supportsSPARQLBindingTransport();
 			if (scalar && (conn == null || serializedBindings)) {
@@ -618,22 +627,16 @@ public class RepositoryFederatedService implements FederatedService {
 						}
 					};
 				}
-				return omittedConflict ? new InsertBindingSetCursor(single, originals.get(0)) : single;
-			}
-			if (serializedBindings && localJoin) {
-				RepositoryConnection localConnection = conn;
-				conn = null;
-				return evaluateOnceAndJoinLocally(service, originals, baseUri, parameterIdentities, localConnection);
+				return inputOmitted ? new InsertBindingSetCursor(single, originals.get(0)) : single;
 			}
 			BindingSet nativeBindings = EmptyBindingSet.getInstance();
 			boolean joinCommonNativeResults = false;
+			NativeInputPlan nativePlan = null;
 			if (!serializedBindings) {
 				if (scopes == null) {
 					scopes = nativeBindingScopes(service, transported, request.nativeParameters());
 				}
-				if (nativePlan == null) {
-					nativePlan = nativeInputPlan(service, scopes);
-				}
+				nativePlan = nativeInputPlan(service, scopes);
 				projectionVars = nativePlan.readNames().isEmpty() ? outputNames : new HashSet<>(nativePlan.outputs());
 				BindingSet common = commonNativeInputs(queryInputs, nativePlan.readNames());
 				if (common != null
@@ -694,7 +697,9 @@ public class RepositoryFederatedService implements FederatedService {
 			if (joinCommonNativeResults) {
 				result = new LocalServiceJoinIteration(mapResponse(raw, response, null), originals, response);
 			} else if (relevantNames.isEmpty()) {
-				result = new SPARQLCrossProductIteration(mapResponse(raw, response, null), originals);
+				// A join on omitted output names still needs the caller's own alias for each compatible row.
+				result = inputOmitted ? new LocalServiceJoinIteration(raw, originals, response)
+						: new SPARQLCrossProductIteration(mapResponse(raw, response, null), originals);
 			} else {
 				CloseableIteration<BindingSet> mapped = new ConvertingIteration<BindingSet, BindingSet>(raw) {
 					@Override
@@ -737,8 +742,25 @@ public class RepositoryFederatedService implements FederatedService {
 		}
 	}
 
+	/** Captures dispatch authority before independent result bindings can be removed from executable input rows. */
+	private Service withResolvedSelector(Service service, List<BindingSet> originals) {
+		Var selector = service.getServiceRef();
+		if (selector.hasValue()) {
+			return service;
+		}
+		for (BindingSet original : originals) {
+			FederatedServiceIdentity.validate(service, original, blankNodeReferencesSupported);
+		}
+		// This provider already identifies the receiving repository. The caller's selector can independently
+		// occur as a result column in the SERVICE body, so later filtering must not change dispatch authority.
+		Service resolved = service.clone();
+		resolved.setServiceRef(Var.of(selector.getName(), originals.getFirst().getValue(selector.getName()),
+				selector.isAnonymous(), true, selector.isBNode()));
+		return resolved;
+	}
+
 	/** Values omitted from executable transport remain in the original solution mapping used by every result join. */
-	private record TransportInput(BindingSet bindings, Set<String> omitted) {
+	private record TransportInput(BindingSet bindings, Set<String> omitted, boolean hasConflict) {
 	}
 
 	private Map<String, Value> provenIndependentFixedOutputs(Service logical, Service executable,
@@ -752,9 +774,7 @@ public class RepositoryFederatedService implements FederatedService {
 		Map<String, Value> candidates = new HashMap<>();
 		for (String name : outputs.guaranteedOutputs()) {
 			Value fixed = outputs.fixedValues().get(name);
-			if (fixed != null && inputs.stream()
-					.anyMatch(row -> row.getValue(name) != null
-							&& !sameFixedValue(row.getValue(name), fixed))) {
+			if (fixed != null && inputs.stream().anyMatch(row -> row.getValue(name) != null)) {
 				candidates.put(name, fixed);
 			}
 		}
@@ -792,16 +812,18 @@ public class RepositoryFederatedService implements FederatedService {
 		return Map.copyOf(proven);
 	}
 
-	private static TransportInput omitProvenFixedConflicts(BindingSet original, Map<String, Value> fixedOutputs) {
+	private static TransportInput omitIndependentFixedOutputs(BindingSet original, Map<String, Value> fixedOutputs) {
 		Set<String> omitted = new HashSet<>();
+		boolean conflict = false;
 		for (var fixed : fixedOutputs.entrySet()) {
 			Value incoming = original.getValue(fixed.getKey());
-			if (incoming != null && !sameFixedValue(incoming, fixed.getValue())) {
+			if (incoming != null) {
 				omitted.add(fixed.getKey());
+				conflict |= !sameFixedValue(incoming, fixed.getValue());
 			}
 		}
 		if (omitted.isEmpty()) {
-			return new TransportInput(original, Set.of());
+			return new TransportInput(original, Set.of(), false);
 		}
 		List<String> names = new ArrayList<>();
 		List<Value> values = new ArrayList<>();
@@ -812,7 +834,8 @@ public class RepositoryFederatedService implements FederatedService {
 			}
 		}
 		BindingSet snapshot = BindingSetSnapshots.copyOf(new ListBindingSet(names, values));
-		return new TransportInput(BindingSetSnapshots.preserveMetadata(original, snapshot), Set.copyOf(omitted));
+		return new TransportInput(BindingSetSnapshots.preserveMetadata(original, snapshot), Set.copyOf(omitted),
+				conflict);
 	}
 
 	private static boolean sameFixedValue(Value first, Value second) {
@@ -843,13 +866,7 @@ public class RepositoryFederatedService implements FederatedService {
 	 */
 	private CloseableIteration<BindingSet> evaluateOnceAndJoinLocally(Service service,
 			List<BindingSet> allBindings, String baseUri, BindingSet parameterIdentities) {
-		return evaluateOnceAndJoinLocally(service, allBindings, baseUri, parameterIdentities, null);
-	}
-
-	private CloseableIteration<BindingSet> evaluateOnceAndJoinLocally(Service service,
-			List<BindingSet> allBindings, String baseUri, BindingSet parameterIdentities,
-			RepositoryConnection suppliedConnection) {
-		return evaluateOnceAndJoinLocally(service, allBindings, baseUri, parameterIdentities, suppliedConnection,
+		return evaluateOnceAndJoinLocally(service, allBindings, baseUri, parameterIdentities, null,
 				EmptyBindingSet.getInstance(), remoteOutputBindingNames(service));
 	}
 
