@@ -18,6 +18,7 @@ import java.util.Set;
 import org.eclipse.rdf4j.common.order.AvailableStatementOrder;
 import org.eclipse.rdf4j.federated.endpoint.Endpoint;
 import org.eclipse.rdf4j.federated.structures.QueryInfo;
+import org.eclipse.rdf4j.federated.structures.QueryType;
 import org.eclipse.rdf4j.model.Value;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
@@ -47,6 +48,8 @@ public class SingleSourceQuery extends AbstractQueryModelNode implements TupleEx
 	private TupleExpr parsedQuery;
 	private final transient Endpoint source;
 	private final transient QueryInfo queryInfo;
+	// Older serialized plans have no saved query type and fall back to the child algebra for binding names.
+	private final QueryType queryType;
 	// Null denotes runtime execution; a non-null map belongs exclusively to this prepared plan.
 	private final Map<String, Value> preparedParameters;
 
@@ -66,6 +69,7 @@ public class SingleSourceQuery extends AbstractQueryModelNode implements TupleEx
 		this.parsedQuery.setParentNode(this);
 		this.source = source;
 		this.queryInfo = queryInfo;
+		this.queryType = queryInfo == null ? null : queryInfo.getQueryType();
 		if (parameters == null) {
 			preparedParameters = null;
 		} else {
@@ -102,14 +106,11 @@ public class SingleSourceQuery extends AbstractQueryModelNode implements TupleEx
 
 	@Override
 	public OutputFacts bindingOutput(QueryAlgebraBindingAnalysis analysis, ReadOnlyContext input) {
-		if (queryInfo.getQueryType() == null) {
-			return analysis.unknownFacts(input);
-		}
-		return switch (queryInfo.getQueryType()) {
+		return switch (queryType) {
 		case SELECT -> analysis.outputOnlyFacts(input, parsedQuery.getBindingNames(), Set.of());
 		case ASK -> analysis.outputOnlyFacts(input, Set.of(), Set.of());
 		case CONSTRUCT, DESCRIBE -> analysis.outputOnlyFacts(input, GRAPH_RESULT_NAMES, GRAPH_ASSURED_NAMES);
-		default -> analysis.unknownFacts(input);
+		case null, default -> analysis.unknownFacts(input);
 		};
 	}
 
@@ -162,25 +163,19 @@ public class SingleSourceQuery extends AbstractQueryModelNode implements TupleEx
 
 	@Override
 	public Set<String> getBindingNames() {
-		if (queryInfo.getQueryType() == null) {
-			return parsedQuery.getBindingNames();
-		}
-		return switch (queryInfo.getQueryType()) {
+		return switch (queryType) {
 		case ASK -> Set.of();
 		case CONSTRUCT, DESCRIBE -> GRAPH_RESULT_NAMES;
-		default -> parsedQuery.getBindingNames();
+		case null, default -> parsedQuery.getBindingNames();
 		};
 	}
 
 	@Override
 	public Set<String> getAssuredBindingNames() {
-		if (queryInfo.getQueryType() == null) {
-			return parsedQuery.getAssuredBindingNames();
-		}
-		return switch (queryInfo.getQueryType()) {
+		return switch (queryType) {
 		case ASK -> Set.of();
 		case CONSTRUCT, DESCRIBE -> GRAPH_ASSURED_NAMES;
-		default -> parsedQuery.getAssuredBindingNames();
+		case null, default -> parsedQuery.getAssuredBindingNames();
 		};
 	}
 
