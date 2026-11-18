@@ -210,6 +210,7 @@ public class RepositoryFederatedService implements FederatedService {
 	}
 
 	private final Repository rep;
+	private final ThreadLocal<SelectConnectionContext> selectConnectionContext = new ThreadLocal<>();
 	private volatile boolean blankNodeReferencesSupported;
 	private volatile boolean canonicalBNodeIDsSupported;
 	private volatile Object bnodeIdentityScope;
@@ -264,6 +265,23 @@ public class RepositoryFederatedService implements FederatedService {
 
 	private RepositoryConnection managedConn = null;
 
+	private static final class SelectConnectionContext {
+		private final RepositoryConnection connection;
+		private boolean claimed;
+
+		private SelectConnectionContext(RepositoryConnection connection) {
+			this.connection = connection;
+		}
+
+		private RepositoryConnection claim() {
+			if (claimed) {
+				return null;
+			}
+			claimed = true;
+			return connection;
+		}
+	}
+
 	/**
 	 * @param repo the repository to be used
 	 */
@@ -288,7 +306,27 @@ public class RepositoryFederatedService implements FederatedService {
 	@Override
 	public CloseableIteration<BindingSet> select(Service service, Set<String> projectionVars,
 			BindingSet bindings, String baseUri) throws QueryEvaluationException {
-		return select(service, projectionVars, bindings, baseUri, null);
+		SelectConnectionContext context = selectConnectionContext.get();
+		return select(service, projectionVars, bindings, baseUri, context == null ? null : context.claim());
+	}
+
+	private CloseableIteration<BindingSet> dispatchSelect(Service service, Set<String> projectionVars,
+			BindingSet bindings, String baseUri, RepositoryConnection suppliedConnection) {
+		SelectConnectionContext previous = selectConnectionContext.get();
+		SelectConnectionContext current = new SelectConnectionContext(suppliedConnection);
+		selectConnectionContext.set(current);
+		try {
+			return select(service, projectionVars, bindings, baseUri);
+		} finally {
+			if (previous == null) {
+				selectConnectionContext.remove();
+			} else {
+				selectConnectionContext.set(previous);
+			}
+			if (!current.claimed && suppliedConnection != null && useFreshConnection) {
+				closeQuietly(suppliedConnection);
+			}
+		}
 	}
 
 	private CloseableIteration<BindingSet> select(Service service, Set<String> projectionVars,
@@ -566,9 +604,8 @@ public class RepositoryFederatedService implements FederatedService {
 			if (scalar && (conn == null || serializedBindings)) {
 				RepositoryConnection scalarConnection = conn;
 				conn = null;
-				CloseableIteration<BindingSet> single = scalarConnection == null
-						? select(service, projectionVars, transported.get(0), baseUri)
-						: select(service, projectionVars, transported.get(0), baseUri, scalarConnection);
+				CloseableIteration<BindingSet> single = dispatchSelect(service, projectionVars, transported.get(0),
+						baseUri, scalarConnection);
 				if (!parameterIdentities.isEmpty()) {
 					RemoteBNode.ResponseScope response = RemoteBNode.newResponseScope(allocation,
 							SimpleValueFactory.getInstance(), bnodeIdentityScope, canonicalBNodeIDsSupported);
@@ -822,9 +859,7 @@ public class RepositoryFederatedService implements FederatedService {
 		BlankNodeAllocationScope allocation = BlankNodeAllocationScope.currentOrNew();
 		CloseableIteration<BindingSet> remote;
 		try (var active = allocation.activate()) {
-			remote = suppliedConnection == null
-					? select(service, projectionVars, nativeInput, baseUri)
-					: select(service, projectionVars, nativeInput, baseUri, suppliedConnection);
+			remote = dispatchSelect(service, projectionVars, nativeInput, baseUri, suppliedConnection);
 		} catch (RuntimeException e) {
 			if (!service.isSilent() || QueryExecutionContext.isReplaySafepointFailure(e)) {
 				throw e;

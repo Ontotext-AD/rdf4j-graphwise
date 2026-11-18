@@ -13,6 +13,7 @@
 package org.eclipse.rdf4j.federated.evaluation;
 
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -29,9 +30,12 @@ import java.util.stream.Collectors;
 
 import org.eclipse.rdf4j.common.annotation.Experimental;
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
+import org.eclipse.rdf4j.common.iteration.CloseableIteratorIteration;
 import org.eclipse.rdf4j.common.iteration.EmptyIteration;
+import org.eclipse.rdf4j.common.iteration.FilterIteration;
 import org.eclipse.rdf4j.common.iteration.LookAheadIteration;
 import org.eclipse.rdf4j.common.iteration.SingletonIteration;
+import org.eclipse.rdf4j.common.iteration.UnionIteration;
 import org.eclipse.rdf4j.federated.FedX;
 import org.eclipse.rdf4j.federated.FedXConfig;
 import org.eclipse.rdf4j.federated.FederationContext;
@@ -55,6 +59,7 @@ import org.eclipse.rdf4j.federated.algebra.FederatedDescribeOperator;
 import org.eclipse.rdf4j.federated.algebra.FilterExpr;
 import org.eclipse.rdf4j.federated.algebra.FilterTuple;
 import org.eclipse.rdf4j.federated.algebra.FilterValueExpr;
+import org.eclipse.rdf4j.federated.algebra.GraphSelectionAware;
 import org.eclipse.rdf4j.federated.algebra.HolderNode;
 import org.eclipse.rdf4j.federated.algebra.NJoin;
 import org.eclipse.rdf4j.federated.algebra.NUnion;
@@ -1810,15 +1815,12 @@ public class FederationEvaluationStrategy extends StrictEvaluationStrategy {
 	public CloseableIteration<BindingSet> evaluateBoundJoinStatementPattern(
 			StatementTupleExpr stmt, List<BindingSet> bindings)
 			throws QueryEvaluationException {
-		if (!(stmt instanceof StatementPattern) || hasCapturedRelationValues(stmt)) {
-			// The batch renderer omits valued variables from its result projection. Scalar evaluation restores
-			// each row's captured values and performs typed identity checks before constructing the result.
+		if (!(stmt instanceof StatementPattern statement)) {
 			return evaluateBindingsIndividually(stmt, bindings, false);
 		}
 		if ((!NativeGraphQuery.isRequired((TupleExpr) stmt)
 				&& bindings.stream().anyMatch(row -> NativeGraphQuery.isRequired((TupleExpr) stmt, row)))
-				|| (stmt instanceof StatementPattern statement
-						&& NativeGraphQuery.requiresScalarBindings(statement, bindings))) {
+				|| NativeGraphQuery.requiresScalarBindings(statement, bindings)) {
 			return evaluateGraphBindingRows(stmt, bindings, false);
 		}
 
@@ -1830,34 +1832,82 @@ public class FederationEvaluationStrategy extends StrictEvaluationStrategy {
 			return evaluateBindingsIndividually(stmt, bindings, false);
 		}
 
-		FilterValueExpr filterExpr = null;
-		if (stmt instanceof FilterTuple) {
-			filterExpr = ((FilterTuple) stmt).getFilterExpr();
+		return evaluateValuesBoundJoin(statement, stmt, bindings, false);
+	}
+
+	/**
+	 * Evaluate the left bind join for the given {@link StatementTupleExpr} and bindings at the relevant endpoints.
+	 *
+	 * @param stmt
+	 * @param bindings
+	 * @return the result iteration
+	 * @throws QueryEvaluationException
+	 * @see {@link BindLeftJoinIteration}
+	 */
+	public CloseableIteration<BindingSet> evaluateLeftBoundJoinStatementPattern(
+			StatementTupleExpr stmt, final List<BindingSet> bindings) throws QueryEvaluationException {
+		if (!(stmt instanceof StatementPattern statement)) {
+			return evaluateBindingsIndividually(stmt, bindings, true);
+		}
+		if (hasBlankNodeBindings(stmt, bindings)) {
+			return evaluateBindingsIndividually(stmt, bindings, true);
+		}
+		if ((!NativeGraphQuery.isRequired((TupleExpr) stmt)
+				&& bindings.stream().anyMatch(row -> NativeGraphQuery.isRequired((TupleExpr) stmt, row)))
+				|| NativeGraphQuery.requiresScalarBindings(statement, bindings)) {
+			return evaluateGraphBindingRows(stmt, bindings, true);
 		}
 
-		AtomicBoolean isEvaluated = new AtomicBoolean(false);
-		boolean nativeGraph = NativeGraphQuery.isRequired((TupleExpr) stmt);
-		String preparedQuery = nativeGraph ? null
-				: QueryStringUtil.selectQueryStringBoundJoinVALUES((StatementPattern) stmt, bindings,
-						filterExpr, isEvaluated, stmt.getExecutionDataset());
+		return evaluateValuesBoundJoin(statement, stmt, bindings, true);
+	}
+
+	private CloseableIteration<BindingSet> evaluateValuesBoundJoin(StatementPattern statement, StatementTupleExpr stmt,
+			List<BindingSet> input, boolean optional) {
+		BoundJoinBatch batch = BoundJoinBatch.prepare(statement, input);
+		CloseableIteration<BindingSet> results = evaluateBatch(statement, stmt, batch, optional);
+		if (batch.scalarRows().isEmpty()) {
+			return results;
+		}
+		return new UnionIteration<>(results, evaluateBindingsIndividually(stmt, batch.scalarRows(), optional));
+	}
+
+	private CloseableIteration<BindingSet> evaluateBatch(StatementPattern statement, StatementTupleExpr stmt,
+			BoundJoinBatch batch, boolean optional) {
+		List<BindingSet> bindings = batch.bindings();
+		if (bindings.isEmpty()) {
+			return optional ? new CloseableIteratorIteration<>(batch.originalRows().iterator())
+					: new EmptyIteration<>();
+		}
+
+		FilterValueExpr filterExpr = stmt instanceof FilterTuple filtered ? filtered.getFilterExpr() : null;
+		boolean nativeGraph = NativeGraphQuery.isRequired(statement);
+		QueryBindingSet graphBindings = nativeGraph ? new QueryBindingSet() : null;
+		var query = QueryStringUtil.prepareBoundJoinVALUES(statement, bindings, filterExpr,
+				nativeGraph ? null : stmt.getExecutionDataset(), graphBindings);
 
 		CloseableIteration<BindingSet> result = null;
 		try {
 			result = nativeGraph
-					? evaluateNativeAtStatementSources(NativeGraphQuery.boundJoin((StatementPattern) stmt, bindings),
+					? evaluateNativeAtStatementSources(
+							NativeGraphQuery.boundJoin(statement, query.queryString(), graphBindings),
 							stmt.getStatementSources(), stmt.getQueryInfo())
-					: evaluateAtStatementSources(preparedQuery, stmt.getStatementSources(), stmt.getQueryInfo());
+					: evaluateAtStatementSources(query.queryString(), stmt.getStatementSources(), stmt.getQueryInfo());
 
-			// apply filter and/or convert to original bindings
-			if (filterExpr != null && !isEvaluated.get()) {
-				result = new BoundJoinVALUESConversionIteration(result, bindings); // apply conversion
-				result = new FilteringIteration(filterExpr, result, this); // apply filter
+			if (!nativeGraph) {
+				result = retainFirstExistenceMatch(statement, stmt, result, bindings, query);
+			}
+			// VALUES rendering leaves the filter to the federation, where all input bindings are available.
+			if (optional) {
+				return new BindLeftJoinIteration(result, bindings, batch.originalRows(), batch.originalIndexes(),
+						query.indexBindingName(), filterExpr, this);
+			}
+			result = new BoundJoinVALUESConversionIteration(result, bindings, query.indexBindingName());
+			if (filterExpr != null) {
+				result = new FilteringIteration(filterExpr, result, this);
 				if (!result.hasNext()) {
 					result.close();
 					return new EmptyIteration<>();
 				}
-			} else {
-				result = new BoundJoinVALUESConversionIteration(result, bindings);
 			}
 
 			return result;
@@ -1873,68 +1923,95 @@ public class FederationEvaluationStrategy extends StrictEvaluationStrategy {
 	}
 
 	/**
-	 * Evaluate the left bind join for the given {@link StatementTupleExpr} and bindings at the relevant endpoints.
-	 *
-	 * @param stmt
-	 * @param bindings
-	 * @return the result iteration
-	 * @throws QueryEvaluationException
-	 * @see {@link BindLeftJoinIteration}
+	 * The scalar prepared-query path performs a single existence check if that input already binds every projected
+	 * variable. Preserve one hit per such input occurrence when several endpoints return its ordinal.
 	 */
-	public CloseableIteration<BindingSet> evaluateLeftBoundJoinStatementPattern(
-			StatementTupleExpr stmt, final List<BindingSet> bindings) throws QueryEvaluationException {
-		if (!(stmt instanceof StatementPattern) || hasCapturedRelationValues(stmt)) {
-			return evaluateBindingsIndividually(stmt, bindings, true);
+	private CloseableIteration<BindingSet> retainFirstExistenceMatch(StatementPattern statement,
+			StatementTupleExpr stmt,
+			CloseableIteration<BindingSet> results,
+			List<BindingSet> bindings, QueryStringUtil.BoundJoinQuery query) {
+		BitSet existenceRows = new BitSet(bindings.size());
+		for (int index = 0; index < bindings.size(); index++) {
+			BindingSet row = bindings.get(index);
+			if (query.valueNames().stream().allMatch(name -> row.getValue(name) != null)) {
+				existenceRows.set(index);
+			}
 		}
-		if (hasBlankNodeBindings(stmt, bindings)) {
-			return evaluateBindingsIndividually(stmt, bindings, true);
+		if (existenceRows.isEmpty() || stmt.getStatementSources()
+				.stream()
+				.map(source -> federationContext.getEndpointManager()
+						.getEndpoint(source.getEndpointID())
+						.getTripleSource())
+				.noneMatch(source -> source.usePreparedQuery(statement, stmt.getQueryInfo()))) {
+			return results;
 		}
-		if ((!NativeGraphQuery.isRequired((TupleExpr) stmt)
-				&& bindings.stream().anyMatch(row -> NativeGraphQuery.isRequired((TupleExpr) stmt, row)))
-				|| (stmt instanceof StatementPattern statement
-						&& NativeGraphQuery.requiresScalarBindings(statement, bindings))) {
-			return evaluateGraphBindingRows(stmt, bindings, true);
-		}
+		return new FilterIteration<>(results) {
+			private final BitSet seen = new BitSet(bindings.size());
 
-		FilterValueExpr filterExpr = null;
-		if (stmt instanceof FilterTuple) {
-			filterExpr = ((FilterTuple) stmt).getFilterExpr();
-		}
-
-		AtomicBoolean isEvaluated = new AtomicBoolean(false);
-		boolean nativeGraph = NativeGraphQuery.isRequired((TupleExpr) stmt);
-		String preparedQuery = nativeGraph ? null
-				: QueryStringUtil.selectQueryStringBoundJoinVALUES((StatementPattern) stmt, bindings,
-						filterExpr, isEvaluated, stmt.getExecutionDataset());
-
-		CloseableIteration<BindingSet> result = null;
-		try {
-			result = nativeGraph
-					? evaluateNativeAtStatementSources(NativeGraphQuery.boundJoin((StatementPattern) stmt, bindings),
-							stmt.getStatementSources(), stmt.getQueryInfo())
-					: evaluateAtStatementSources(preparedQuery, stmt.getStatementSources(), stmt.getQueryInfo());
-
-			// apply filter and/or convert to original bindings
-			if (filterExpr != null && !isEvaluated.get()) {
-				result = new BindLeftJoinIteration(result, bindings); // apply conversion
-				result = new FilteringIteration(filterExpr, result, this); // apply filter
-				if (!result.hasNext()) {
-					result.close();
-					return new EmptyIteration<>();
+			@Override
+			protected boolean accept(BindingSet row) {
+				int index = BoundJoinVALUESConversionIteration.rowIndex(row, query.indexBindingName());
+				if (seen.get(index)) {
+					return false;
 				}
-			} else {
-				result = new BindLeftJoinIteration(result, bindings);
+				if (existenceRows.get(index)) {
+					seen.set(index);
+				}
+				return true;
 			}
 
-			return result;
-		} catch (Throwable t) {
-			if (result != null) {
-				result.close();
+			@Override
+			protected void handleClose() {
+				// The wrapped iteration is closed by FilterIteration.
 			}
-			if (t instanceof InterruptedException) {
-				Thread.currentThread().interrupt();
+		};
+	}
+
+	/**
+	 * A captured variable is rendered as a query term, so the remote result omits that column. Restore captured
+	 * bindings on candidate rows and remember original row indexes to handle conflicts and unmatched OPTIONALs.
+	 */
+	private record BoundJoinBatch(List<BindingSet> bindings, List<BindingSet> originalRows, int[] originalIndexes,
+			List<BindingSet> scalarRows) {
+
+		static BoundJoinBatch prepare(StatementPattern statement, List<BindingSet> input) {
+			var required = BoundFilterUtil.merge(EmptyBindingSet.getInstance(), statement);
+			if (required.isEmpty()) {
+				return new BoundJoinBatch(List.of(), input, null, List.of());
 			}
-			throw ExceptionUtil.toQueryEvaluationException(t);
+			String graphVariable = varyingNamedGraph(statement);
+			if (required.get().isEmpty() && (graphVariable == null
+					|| input.stream().noneMatch(row -> FedXUtil.isDefaultGraphAlias(row.getValue(graphVariable))))) {
+				return new BoundJoinBatch(input, input, null, List.of());
+			}
+
+			List<BindingSet> compatible = new ArrayList<>(input.size());
+			List<BindingSet> originalRows = new ArrayList<>(input.size());
+			List<BindingSet> scalarRows = new ArrayList<>();
+			int[] originalIndexes = new int[input.size()];
+			for (BindingSet row : input) {
+				var merged = BoundFilterUtil.merge(row, required.get());
+				if (merged.isPresent()) {
+					if (graphVariable != null && FedXUtil.isDefaultGraphAlias(merged.get().getValue(graphVariable))) {
+						// GRAPH ?g only enumerates named graphs. Render each default-graph alias as a GRAPH term.
+						scalarRows.add(row);
+						continue;
+					}
+					originalIndexes[compatible.size()] = originalRows.size();
+					compatible.add(merged.get());
+				}
+				originalRows.add(row);
+			}
+			return new BoundJoinBatch(compatible, originalRows, originalIndexes, scalarRows);
+		}
+
+		private static String varyingNamedGraph(StatementPattern statement) {
+			Var context = statement.getContextVar();
+			if (statement.getScope() != StatementPattern.Scope.NAMED_CONTEXTS || context == null || context.hasValue()
+					|| statement instanceof GraphSelectionAware aware && aware.getResolvedGraphSelection() != null) {
+				return null;
+			}
+			return context.getName();
 		}
 	}
 
@@ -1958,17 +2035,6 @@ public class FederationEvaluationStrategy extends StrictEvaluationStrategy {
 			}
 		}
 		return false;
-	}
-
-	private static boolean hasCapturedRelationValues(StatementTupleExpr expression) {
-		boolean[] captured = { false };
-		expression.visit(new AbstractSimpleQueryModelVisitor<RuntimeException>(true) {
-			@Override
-			public void meet(Var variable) {
-				captured[0] |= variable.hasValue() && !variable.isConstant() && !variable.isAnonymous();
-			}
-		});
-		return captured[0];
 	}
 
 	private static boolean hasBlankNodeBindings(BindingSet bindings) {

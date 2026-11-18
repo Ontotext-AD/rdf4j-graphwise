@@ -60,9 +60,8 @@ public class GeoRelationQuerySpecBuilder implements SearchQueryInterpreter {
 
 					Value geometry = resolver.value(args.get(0));
 					Literal qshape = geometry instanceof Literal literal ? literal : null;
-					String varShape = getVarName(args.get(1));
-
-					if (qshape == null || varShape == null) {
+					if (qshape == null || !(args.get(1) instanceof Var shape) || shape.hasValue()
+							|| shape.isConstant()) {
 						return;
 					}
 
@@ -73,8 +72,8 @@ public class GeoRelationQuerySpecBuilder implements SearchQueryInterpreter {
 						fVar = ((ExtensionElem) parent).getName();
 						QueryModelNode extension = parent.getParentNode();
 						filter = getFilter(extension.getParentNode(), fVar);
-					} else if (parent instanceof Filter) {
-						filter = (Filter) parent;
+					} else if (parent instanceof Filter containingFilter && containingFilter.getCondition() == f) {
+						filter = containingFilter;
 					}
 
 					if (filter == null) {
@@ -87,7 +86,7 @@ public class GeoRelationQuerySpecBuilder implements SearchQueryInterpreter {
 					spec.setQueryGeometry(qshape);
 					spec.setFunctionValueVar(fVar);
 					spec.setFilter(filter);
-					specs.put(varShape, spec);
+					specs.put(shape.getName(), spec);
 				}
 			}
 
@@ -98,23 +97,16 @@ public class GeoRelationQuerySpecBuilder implements SearchQueryInterpreter {
 						&& !sp.getSubjectVar().hasValue() && !sp.getObjectVar().hasValue()
 						&& index.isGeoField(SearchFields.getPropertyField(propertyName))) {
 					String objectVarName = sp.getObjectVar().getName();
-					GeoRelationQuerySpec spec = specs.remove(objectVarName);
-					if (spec != null && isChildOf(sp, spec.getFilter())) {
+					GeoRelationQuerySpec spec = specs.get(objectVarName);
+					if (spec != null && SearchQueryBindingResolver.isRequiredGeometryInput(sp, spec.getFilter(),
+							spec.getFunctionParent())) {
+						specs.remove(objectVarName);
 						spec.setGeometryPattern(sp);
 						results.add(spec);
 					}
 				}
 			}
 		});
-	}
-
-	private static boolean isChildOf(QueryModelNode child, QueryModelNode parent) {
-		for (QueryModelNode node = child.getParentNode(); node != null; node = node.getParentNode()) {
-			if (node == parent) {
-				return true;
-			}
-		}
-		return false;
 	}
 
 	private static Filter getFilter(QueryModelNode node, String varName) {

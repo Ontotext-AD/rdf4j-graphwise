@@ -23,9 +23,18 @@ import org.eclipse.rdf4j.query.algebra.QueryModelNode;
 import org.eclipse.rdf4j.query.algebra.StatementPattern;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.Var;
+import org.eclipse.rdf4j.query.algebra.VariableScopeChange;
 import org.eclipse.rdf4j.query.impl.ListBindingSet;
 
 public abstract class AbstractSearchQueryEvaluator implements SearchQueryEvaluator {
+
+	static void replaceKeepingScope(QueryModelNode original, QueryModelNode replacement) {
+		if (original instanceof VariableScopeChange source && source.isVariableScopeChange()
+				&& replacement instanceof VariableScopeChange target) {
+			target.setVariableScopeChange(true);
+		}
+		original.replaceWith(replacement);
+	}
 
 	/**
 	 * Keeps the named outputs of relational input patterns when their values are consumed by an index lookup or
@@ -52,7 +61,10 @@ public abstract class AbstractSearchQueryEvaluator implements SearchQueryEvaluat
 			BindingSetAssignment outputs = new BindingSetAssignment();
 			outputs.setBindingSets(List.of(new ListBindingSet(names, names.stream().map(captured::get).toList())));
 			Join restored = new Join();
-			placeholder.replaceWith(restored);
+			replaceKeepingScope(placeholder, restored);
+			if (placeholder instanceof VariableScopeChange scope) {
+				scope.setVariableScopeChange(false);
+			}
 			restored.setLeftArg(placeholder);
 			restored.setRightArg(outputs);
 		}
@@ -66,9 +78,9 @@ public abstract class AbstractSearchQueryEvaluator implements SearchQueryEvaluat
 		// repeatable index result collections can still be normalized to EmptySet here.
 		if (bsa != null && bsa.getBindingSets() != null
 				&& (!bsa.hasRepeatableBindingSets() || bsa.getBindingSets().iterator().hasNext())) {
-			placeholder.replaceWith(bsa);
+			replaceKeepingScope(placeholder, bsa);
 		} else {
-			placeholder.replaceWith(new EmptySet());
+			replaceKeepingScope(placeholder, new EmptySet());
 		}
 	}
 

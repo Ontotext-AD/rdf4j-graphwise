@@ -1903,8 +1903,9 @@ final class LmdbNativeAggregatePlanner extends LmdbNativeAggregateFilterCompiler
 			}
 			return plan;
 		}
-		if (expr instanceof TupleFunctionCall) {
-			return compileTupleFunction((TupleFunctionCall) expr);
+		if (expr instanceof TupleFunctionCall call) {
+			// The generic evaluator owns guarded dispatch, fallback, and active-graph arguments.
+			return call.getFallback() == null ? compileTupleFunction(call) : null;
 		}
 		if (expr instanceof org.eclipse.rdf4j.query.algebra.TripleRef) {
 			SlotPlan tripleScan = compileTripleRef((org.eclipse.rdf4j.query.algebra.TripleRef) expr);

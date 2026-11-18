@@ -2172,7 +2172,11 @@ public final class QueryAlgebraBindingAnalysis {
 					.withConditionalInputs(conditional);
 		}
 		if (expression instanceof TupleFunctionCall call) {
-			return OutputFacts.known(variableNames(call.getResultVars()), Set.of(), Map.of(), Map.of(), input, true);
+			Set<String> possible = variableNames(call.getResultVars());
+			if (call.getFallback() != null) {
+				possible = union(possible, call.getFallback().getBindingNames());
+			}
+			return OutputFacts.known(possible, Set.of(), Map.of(), Map.of(), input, true);
 		}
 		if (expression instanceof Service service) {
 			OutputFacts child = outputFacts(service.getServiceExpr(),

@@ -1494,24 +1494,53 @@ public class DefaultEvaluationStrategy implements EvaluationStrategy, FederatedS
 
 	protected QueryEvaluationStep prepare(TupleFunctionCall expr, QueryEvaluationContext context)
 			throws QueryEvaluationException {
-		TupleFunction func = tupleFuncRegistry.get(expr.getURI())
-				.orElseThrow(() -> new QueryEvaluationException("Unknown tuple function '" + expr.getURI() + "'"));
+		return prepareRegisteredTupleFunction(expr, context, tupleFuncRegistry);
+	}
 
-		List<ValueExpr> args = expr.getArgs();
-		QueryValueEvaluationStep[] argEpresions = new QueryValueEvaluationStep[args.size()];
-		for (int i = 0; i < args.size(); i++) {
-			argEpresions[i] = precompile(args.get(i), context);
+	protected final QueryEvaluationStep prepareRegisteredTupleFunction(TupleFunctionCall expr,
+			QueryEvaluationContext context, TupleFunctionRegistry registry) {
+		TupleFunction func = registry.get(expr.getURI()).orElse(null);
+		var activeGraph = expr.appendsActiveGraph() ? context.getActiveGraph() : null;
+		Resource graph = activeGraph == null ? null : activeGraph.physicalGraph();
+		TupleExpr fallback = expr.getFallback();
+		if (fallback != null && (func == null || activeGraph != null && graph == null)) {
+			return precompile(fallback, context);
 		}
+		if (func == null) {
+			throw new QueryEvaluationException("Unknown tuple function '" + expr.getURI() + "'");
+		}
+		List<ValueExpr> args = expr.getArgs();
+		QueryValueEvaluationStep[] arguments = new QueryValueEvaluationStep[args.size()];
+		for (int i = 0; i < args.size(); i++) {
+			arguments[i] = precompile(args.get(i), context);
+		}
+		ValueExpr argumentGuard = expr.getArgumentGuard();
+		QueryValueEvaluationStep guard = argumentGuard == null ? null : precompile(argumentGuard, context);
+		QueryEvaluationStep scalar = argumentGuard == null ? null : precompile(fallback, context);
 
 		return captureResultValues(bindings -> {
-			Value[] argValues = new Value[args.size()];
-			for (int i = 0; i < args.size(); i++) {
-				argValues[i] = argEpresions[i].evaluate(bindings);
+			if (guard != null && !acceptsTupleFunctionInput(guard, bindings)) {
+				return scalar.evaluate(bindings);
+			}
+			Value[] argValues = new Value[arguments.length + (graph == null ? 0 : 1)];
+			for (int i = 0; i < arguments.length; i++) {
+				argValues[i] = arguments[i].evaluate(bindings);
+			}
+			if (graph != null) {
+				argValues[arguments.length] = graph;
 			}
 
 			return evaluate(func, expr.getResultVars(), bindings,
 					tripleSource.getValueFactory(), argValues);
 		});
+	}
+
+	private boolean acceptsTupleFunctionInput(QueryValueEvaluationStep guard, BindingSet bindings) {
+		try {
+			return isTrue(guard, bindings);
+		} catch (ValueExprEvaluationException e) {
+			return false;
+		}
 	}
 
 	public static Value getVarValue(Var var, BindingSet bindings) {

@@ -74,7 +74,7 @@ public final class TupleFunctionGroupQueryEvaluationStep implements QueryEvaluat
 			if (node instanceof Join join && (node == root || !join.isVariableScopeChange())) {
 				remaining.push(join.getRightArg());
 				remaining.push(join.getLeftArg());
-			} else if (node instanceof TupleFunctionCall call) {
+			} else if (node instanceof TupleFunctionCall call && call.getFallback() == null) {
 				functions.add(call);
 			} else {
 				return null;

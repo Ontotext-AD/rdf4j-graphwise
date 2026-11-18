@@ -83,6 +83,7 @@ import org.eclipse.rdf4j.query.algebra.evaluation.QueryOptimizerTest;
 import org.eclipse.rdf4j.query.algebra.evaluation.TripleSource;
 import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedService;
 import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedServiceResolver;
+import org.eclipse.rdf4j.query.algebra.evaluation.optimizer.ParentReferenceChecker;
 import org.eclipse.rdf4j.query.algebra.evaluation.optimizer.QueryJoinOptimizer;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractQueryModelVisitor;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
@@ -219,6 +220,23 @@ public class QueryJoinOptimizerTest extends QueryOptimizerTest {
 
 		new QueryJoinOptimizer(new EvaluationStatistics(), new EmptyTripleSource())
 				.optimize(parsed.getTupleExpr(), null, EmptyBindingSet.getInstance());
+	}
+
+	@Test
+	public void reorderScopedOperandsRetainsTheOptimizedRoots() {
+		String query = "SELECT * WHERE { "
+				+ "{ GRAPH <urn:first> { VALUES ?x { 1 } } VALUES ?y { 1 } } "
+				+ "{ GRAPH <urn:second> { VALUES ?x { 2 } } VALUES ?y { 2 } } }";
+		QueryRoot root = (QueryRoot) new SPARQLParser().parseQuery(query, null).getTupleExpr();
+		var bindings = EmptyBindingSet.getInstance();
+		var optimizer = new QueryJoinOptimizer(new EvaluationStatistics(), new EmptyTripleSource());
+
+		optimizer.optimize(root, null, bindings);
+
+		new ParentReferenceChecker(optimizer).optimize(root, null, bindings);
+		Join outer = (Join) ((Projection) root.getArg()).getArg();
+		assertTrue(((Join) outer.getLeftArg()).isVariableScopeChange());
+		assertTrue(((Join) outer.getRightArg()).isVariableScopeChange());
 	}
 
 	@Test

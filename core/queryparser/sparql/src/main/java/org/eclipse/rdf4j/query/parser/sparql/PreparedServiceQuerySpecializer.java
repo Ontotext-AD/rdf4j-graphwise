@@ -111,7 +111,13 @@ final class PreparedServiceQuerySpecializer {
 				if (primitiveSyntax != null) {
 					Primitive primitive = primitives.computeIfAbsent(primitiveSyntax,
 							node -> new Primitive(provenance.range(node)));
-					if (!replacement.substitutedTerm() && !variable.isAnonymous()) {
+					boolean graphSelector = primitiveSyntax instanceof ASTGraphGraphPattern;
+					boolean namedOutput = !replacement.substitutedTerm() && !variable.isAnonymous();
+					if ((!namedOutput || graphSelector) && !validPosition(variable, role, replacement.value())) {
+						primitive.empty = true;
+						continue;
+					}
+					if (namedOutput) {
 						Value previous = primitive.outputs.putIfAbsent(variable.getName(), replacement.value());
 						if (previous != null && !previous.equals(replacement.value())) {
 							throw unsupported("one relation has conflicting captured outputs");
@@ -126,14 +132,11 @@ final class PreparedServiceQuerySpecializer {
 							throw unsupported("a relation output has no lexical binding frame");
 						}
 						restores.add(new Restore(owner, variable.getName(), replacement.value(), primitive.range));
-						// A named relation variable retains its graph/path output domain. In particular, a nullable
-						// path with a named endpoint does not acquire the semantics of a substituted RDF term.
 						SourceRange range = provenance.range(occurrence);
-						put(edits, range, source.substring(range.start(), range.end()));
-						continue;
-					}
-					if (!validPosition(variable, role, replacement.value())) {
-						primitive.empty = true;
+						// GRAPH must select the captured context before evaluating its body. Other named relation
+						// variables retain their pattern/path semantics, including nullable paths with named endpoints.
+						put(edits, range, graphSelector ? term(replacement.value())
+								: source.substring(range.start(), range.end()));
 						continue;
 					}
 				} else if (role == VariableRole.SERVICE_SELECTOR && !(replacement.value() instanceof IRI)) {
@@ -277,14 +280,20 @@ final class PreparedServiceQuerySpecializer {
 					});
 				}
 			}
-			for (Primitive operand : operands.values()) {
-				// VALUES belongs at the existing operand boundary. Extra braces would change FILTER/BIND scope.
+			Map<SourceRange, String> graphOutputs = new LinkedHashMap<>();
+			for (var entry : operands.entrySet()) {
+				Primitive operand = entry.getValue();
 				StringBuilder head = new StringBuilder(" VALUES (");
 				operand.outputs.keySet().forEach(name -> head.append('?').append(name).append(' '));
 				head.append(") { (");
 				operand.outputs.values().forEach(value -> head.append(term(value)).append(' '));
 				head.append(") } ");
-				put(edits, new SourceRange(operand.range.start(), operand.range.start()), head.toString());
+				if (entry.getKey() instanceof ASTGraphGraphPattern) {
+					graphOutputs.put(operand.range, head.toString());
+				} else {
+					// Keep BGP output bindings at the lexical boundary to preserve FILTER/BIND scope.
+					put(edits, new SourceRange(operand.range.start(), operand.range.start()), head.toString());
+				}
 			}
 			relationalBinds.removeAll(incompatibleRelationalComponents.keySet());
 			preserveRelationalBinds(syntax, parameters, provenance, relationalBinds, eliminated, edits);
@@ -296,6 +305,14 @@ final class PreparedServiceQuerySpecializer {
 					edits.entrySet().removeIf(edit -> contains(discarded, edit.getKey()));
 					put(edits, discarded, selector.getValue());
 				}
+			}
+			for (var graphOutput : graphOutputs.entrySet()) {
+				SourceRange range = graphOutput.getKey();
+				// A fixed GRAPH still joins its selected name with the body result. Restore that public
+				// binding at the GRAPH operand boundary without supplying it to the body.
+				edits.merge(new SourceRange(range.start(), range.start()), "{ ", String::concat);
+				edits.merge(new SourceRange(range.end(), range.end()), graphOutput.getValue() + "} ",
+						(following, attachment) -> attachment + following);
 			}
 			List<Map.Entry<SourceRange, String>> ordered = new ArrayList<>(edits.entrySet());
 			ordered.sort(Comparator.<Map.Entry<SourceRange, String>>comparingInt(edit -> edit.getKey().start())
@@ -496,6 +513,11 @@ final class PreparedServiceQuerySpecializer {
 
 	private static void verifyReplacedOutputs(Node syntax, Set<String> outputs, SourceProvenance provenance,
 			Map<SourceRange, String> edits) {
+		if (syntax instanceof ASTGraphGraphPattern graph) {
+			// GRAPH owns only its selector occurrence. Its body has independent reads and binding declarations.
+			verifyReplacedOutputs(graph.jjtGetChild(0), outputs, provenance, edits);
+			return;
+		}
 		if (syntax instanceof ASTVar variable && outputs.contains(variable.getName())
 				&& !edits.containsKey(provenance.range(syntax))) {
 			throw unsupported("a captured output still has an unbound occurrence in its relation");

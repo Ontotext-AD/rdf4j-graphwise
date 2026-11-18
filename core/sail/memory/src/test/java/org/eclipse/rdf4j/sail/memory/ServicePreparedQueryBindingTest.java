@@ -47,6 +47,8 @@ import org.eclipse.rdf4j.http.client.SPARQLProtocolSession;
 import org.eclipse.rdf4j.model.BNode;
 import org.eclipse.rdf4j.model.Value;
 import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
+import org.eclipse.rdf4j.model.vocabulary.RDF4J;
+import org.eclipse.rdf4j.model.vocabulary.SESAME;
 import org.eclipse.rdf4j.model.vocabulary.XSD;
 import org.eclipse.rdf4j.query.Binding;
 import org.eclipse.rdf4j.query.BindingSet;
@@ -1353,6 +1355,122 @@ class ServicePreparedQueryBindingTest {
 								.containsExactlyInAnyOrderElementsOf(test.expected());
 					}
 				}));
+			}
+		}));
+	}
+
+	@Test
+	void capturedGraphSelectorsPreserveSameNamedBodyScopes() {
+		var graph = VF.createIRI("urn:graph");
+		var other = VF.createIRI("urn:other");
+		Map<String, Value> parameters = Map.of("g", graph);
+		MapBindingSet match = new MapBindingSet();
+		match.addBinding("g", graph);
+		List<BasicGraphPatternCase> cases = List.of(
+				new BasicGraphPatternCase("VALUES ?g {<urn:graph>}", List.of(match)),
+				new BasicGraphPatternCase("VALUES ?g {<urn:other>}", List.of()),
+				new BasicGraphPatternCase("BIND(<urn:graph> AS ?g)", List.of(match)),
+				new BasicGraphPatternCase("BIND(<urn:other> AS ?g)", List.of()),
+				new BasicGraphPatternCase("VALUES ?g {<urn:graph> <urn:other> <urn:graph> UNDEF}",
+						List.of(match, match, match)),
+				new BasicGraphPatternCase("{SELECT ?g WHERE {VALUES ?g {<urn:graph> <urn:other>}}}", List.of(match)),
+				new BasicGraphPatternCase("?s <urn:p> ?o FILTER(sameTerm(?g, <urn:graph>))", List.of(match)),
+				new BasicGraphPatternCase("BIND(?g AS ?copy) FILTER(sameTerm(?copy, <urn:graph>))", List.of(match)),
+				new BasicGraphPatternCase("{SELECT ?copy WHERE {BIND(<urn:other> AS ?g) BIND(?g AS ?copy)}} "
+						+ "FILTER(sameTerm(?copy, <urn:other>))", List.of(match)),
+				new BasicGraphPatternCase("GRAPH ?g {VALUES ?g {<urn:graph>}}", List.of(match)),
+				new BasicGraphPatternCase("GRAPH ?g {VALUES ?g {<urn:graph>}}GRAPH ?g {VALUES ?g {UNDEF}}",
+						List.of(match)));
+		assertAll(List.of(false, true).stream().map(sparql -> () -> {
+			try (Harness harness = new Harness(sparql)) {
+				try (var connection = harness.data.getConnection()) {
+					connection.add(VF.createIRI("urn:a"), VF.createIRI("urn:p"), VF.createLiteral("other"), other);
+				}
+				assertAll(cases.stream().map(test -> () -> {
+					String query = "SELECT ?g WHERE { GRAPH ?g {" + test.body() + "} }";
+					assertThat(Harness.evaluate(harness.data, query, parameters)).as("local GRAPH query=%s", query)
+							.containsExactlyInAnyOrderElementsOf(test.expected());
+					assertThat(harness.service(query, parameters)).as("adapter=%s GRAPH query=%s", sparql, query)
+							.containsExactlyInAnyOrderElementsOf(test.expected());
+				}));
+			}
+		}));
+	}
+
+	@Test
+	void capturedGraphSelectorsPreserveDefaultGraphAliases() {
+		assertAll(List.of(false, true).stream().map(sparql -> () -> {
+			try (Harness harness = new Harness(sparql)) {
+				for (var graph : List.of(RDF4J.NIL, SESAME.NIL)) {
+					String query = "SELECT ?g WHERE { GRAPH ?g { VALUES ?g { UNDEF } } }";
+					Map<String, Value> parameters = Map.of("g", graph);
+					MapBindingSet row = new MapBindingSet();
+					row.addBinding("g", graph);
+					assertThat(Harness.evaluate(harness.data, query, parameters)).containsExactly(row);
+					assertThat(harness.service(query, parameters)).containsExactly(row);
+				}
+			}
+		}));
+	}
+
+	@Test
+	void capturedGraphSelectorsPreserveCanonicalBlankNodes() {
+		assertAll(List.of(false, true).stream().map(sparql -> () -> {
+			try (Harness harness = new Harness(sparql)) {
+				var graph = VF.createBNode("graph-id");
+				var object = VF.createLiteral("result");
+				try (var connection = harness.data.getConnection()) {
+					connection.add(VF.createIRI("urn:a"), VF.createIRI("urn:blank-context"), object, graph);
+				}
+				String readGraph = "SELECT ?g WHERE { GRAPH ?g { <urn:a> <urn:blank-context> ?o } }";
+				Value alias = harness.service(readGraph, Map.of()).getFirst().getValue("g");
+				assertThat(alias).isInstanceOf(RemoteBNode.class);
+				String query = "SELECT ?g ?o WHERE { GRAPH ?g { VALUES ?g { <_:graph-id> UNDEF <urn:different> } "
+						+ "<urn:a> <urn:blank-context> ?o } }";
+				assertThat(harness.service(query, Map.of("g", alias))).hasSize(2).allSatisfy(row -> {
+					assertThat(row.getValue("g")).isSameAs(alias);
+					assertThat(row.getValue("o")).isEqualTo(object);
+				});
+			}
+		}));
+	}
+
+	@Test
+	void capturedGraphSelectorsEvaluateOnlyTheSelectedGraphBody() {
+		assertAll(List.of(false, true).stream().map(sparql -> () -> {
+			try (Harness outer = new Harness(sparql); Harness inner = new Harness(sparql)) {
+				var selectedGraph = VF.createIRI("urn:graph");
+				var selectedEndpoint = VF.createIRI("urn:selected-endpoint");
+				var otherEndpoint = VF.createIRI("urn:other-endpoint");
+				var predicate = VF.createIRI("urn:endpoint-property");
+				var subject = VF.createIRI("urn:a");
+				try (var connection = outer.data.getConnection()) {
+					connection.add(subject, predicate, selectedEndpoint, selectedGraph);
+					connection.add(subject, predicate, otherEndpoint, VF.createIRI("urn:other-graph"));
+				}
+				List<String> invokedEndpoints = new ArrayList<>();
+				outer.data.setFederatedServiceResolver(selector -> {
+					invokedEndpoints.add(selector);
+					return inner.endpoint;
+				});
+				String query = "SELECT ?g WHERE { GRAPH ?g { VALUES ?g { UNDEF } "
+						+ "?s <urn:endpoint-property> ?endpoint SERVICE ?endpoint { VALUES ?reply { true } } } }";
+				assertAll(() -> {
+					MapBindingSet row = new MapBindingSet();
+					row.addBinding("g", selectedGraph);
+					Map<String, Value> parameters = Map.of("g", selectedGraph);
+					assertThat(Harness.evaluate(outer.data, query, parameters)).containsExactly(row);
+					assertThat(invokedEndpoints).containsExactly(selectedEndpoint.stringValue());
+					invokedEndpoints.clear();
+					assertThat(outer.service(query, parameters)).containsExactly(row);
+					assertThat(invokedEndpoints).containsExactly(selectedEndpoint.stringValue());
+				}, () -> {
+					invokedEndpoints.clear();
+					Map<String, Value> parameters = Map.of("g", VF.createLiteral("not a graph name"));
+					assertThat(Harness.evaluate(outer.data, query, parameters)).isEmpty();
+					assertThat(outer.service(query, parameters)).isEmpty();
+					assertThat(invokedEndpoints).isEmpty();
+				});
 			}
 		}));
 	}

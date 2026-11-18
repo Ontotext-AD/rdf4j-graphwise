@@ -938,6 +938,84 @@ class RepositoryFederatedServiceRegressionTest {
 	}
 
 	@Test
+	void localJoinPreservesSelectOverrideDispatch() throws Exception {
+		assertSelectOverrideDispatch(true, List.of(
+				binding("x", VF.createLiteral("first")),
+				binding("x", VF.createLiteral("second"))));
+		assertSelectOverrideDispatch(false, List.of(
+				binding("x", VF.createLiteral("same")),
+				binding("x", VF.createLiteral("same"))));
+	}
+
+	private static void assertSelectOverrideDispatch(boolean serializedBindingTransport, List<BindingSet> inputs)
+			throws Exception {
+		Harness harness = new Harness(serializedBindingTransport);
+		when(harness.query.evaluate()).thenAnswer(invocation -> tupleResult(List.of()));
+		AtomicInteger selectCalls = new AtomicInteger();
+		RepositoryFederatedService serviceOverride = new RepositoryFederatedService(harness.repository, false) {
+			@Override
+			public CloseableIteration<BindingSet> select(Service service, Set<String> projectionVars,
+					BindingSet bindings, String baseUri) throws QueryEvaluationException {
+				selectCalls.incrementAndGet();
+				return new ListIteration<>(List.of());
+			}
+		};
+		serviceOverride.setBoundJoinBlockSize(1);
+
+		Service service = parsedService("BIND(?x AS ?y)");
+		assertEquals(List.of(), evaluate(serviceOverride, service, inputs));
+
+		assertEquals(1, selectCalls.get());
+		verify(harness.query, never()).evaluate();
+	}
+
+	@Test
+	void nestedSelectOverrideDoesNotConsumeOuterConnection() throws Exception {
+		Repository repository = mock(Repository.class);
+		RepositoryConnection outerConnection = mock(RepositoryConnection.class);
+		RepositoryConnection nestedConnection = mock(RepositoryConnection.class);
+		TupleQuery outerQuery = mock(TupleQuery.class);
+		TupleQuery nestedQuery = mock(TupleQuery.class);
+		when(repository.getConnection()).thenReturn(outerConnection, nestedConnection);
+		when(outerConnection.supportsSPARQLBindingTransport()).thenReturn(true);
+		when(nestedConnection.supportsSPARQLBindingTransport()).thenReturn(true);
+		when(outerConnection.prepareTupleQuery(any(QueryLanguage.class), anyString(), nullable(String.class)))
+				.thenReturn(outerQuery);
+		when(nestedConnection.prepareTupleQuery(any(QueryLanguage.class), anyString(), nullable(String.class)))
+				.thenReturn(nestedQuery);
+		when(outerQuery.evaluate()).thenAnswer(invocation -> tupleResult(List.of()));
+		when(nestedQuery.evaluate()).thenAnswer(invocation -> tupleResult(List.of()));
+		AtomicBoolean enterNested = new AtomicBoolean(true);
+		Service nestedService = parsedService("BIND(\"nested\" AS ?z)");
+		RepositoryFederatedService serviceOverride = new RepositoryFederatedService(repository, false) {
+			@Override
+			public CloseableIteration<BindingSet> select(Service service, Set<String> projectionVars,
+					BindingSet bindings, String baseUri) throws QueryEvaluationException {
+				if (enterNested.getAndSet(false)) {
+					assertEquals(List.of(), RepositoryFederatedServiceRegressionTest.evaluate(this, nestedService,
+							inputBindings(2)));
+				}
+				return super.select(service, projectionVars, bindings, baseUri);
+			}
+		};
+		serviceOverride.setBoundJoinBlockSize(1);
+
+		Service outerService = parsedService("BIND(?x AS ?y)");
+		assertEquals(List.of(), evaluate(serviceOverride, outerService, List.of(
+				binding("x", VF.createLiteral("first")),
+				binding("x", VF.createLiteral("second")))));
+
+		ArgumentCaptor<String> outerSource = ArgumentCaptor.forClass(String.class);
+		verify(outerConnection).prepareTupleQuery(any(QueryLanguage.class), outerSource.capture(),
+				nullable(String.class));
+		ArgumentCaptor<String> nestedSource = ArgumentCaptor.forClass(String.class);
+		verify(nestedConnection).prepareTupleQuery(any(QueryLanguage.class), nestedSource.capture(),
+				nullable(String.class));
+		assertTrue(outerSource.getValue().contains("BIND(?x AS ?y)"), outerSource.getValue());
+		assertTrue(nestedSource.getValue().contains("BIND(\"nested\" AS ?z)"), nestedSource.getValue());
+	}
+
+	@Test
 	void localJoinDoesNotReadRemoteRowsUntilConsumedAndClosesOnEarlyClose() throws Exception {
 		Harness harness = new Harness();
 		Value value = VF.createLiteral("value");

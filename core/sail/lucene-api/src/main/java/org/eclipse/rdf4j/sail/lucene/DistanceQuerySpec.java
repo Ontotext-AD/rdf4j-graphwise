@@ -54,10 +54,16 @@ public class DistanceQuerySpec extends AbstractSearchQueryEvaluator {
 	private Filter filter;
 
 	public DistanceQuerySpec(FunctionCall distanceFunction, ValueExpr distanceExpr, String distVar, Filter filter) {
+		this(distanceFunction, distanceExpr, distVar, filter, distanceFromExpression(distanceExpr));
+	}
+
+	DistanceQuerySpec(FunctionCall distanceFunction, ValueExpr distanceExpr, String distVar, Filter filter,
+			double distance) {
 		this.distanceFunction = distanceFunction;
 		this.distanceExpr = distanceExpr;
 		this.distanceVar = distVar;
 		this.filter = filter;
+		this.distance = distance;
 		if (distanceFunction != null) {
 			List<ValueExpr> args = distanceFunction.getArgs();
 			this.from = getLiteral(args.get(0));
@@ -68,12 +74,11 @@ public class DistanceQuerySpec extends AbstractSearchQueryEvaluator {
 			this.geoVar = null;
 			this.units = null;
 		}
-		if (distanceExpr != null) {
-			Literal dist = getLiteral(distanceExpr);
-			this.distance = (dist != null) ? dist.doubleValue() : Double.NaN;
-		} else {
-			this.distance = Double.NaN;
-		}
+	}
+
+	private static double distanceFromExpression(ValueExpr distanceExpr) {
+		Literal literal = getLiteral(distanceExpr);
+		return literal != null ? literal.doubleValue() : Double.NaN;
 	}
 
 	public DistanceQuerySpec(Literal from, IRI units, double dist, String distVar, IRI geoProperty, String geoVar,
@@ -187,9 +192,9 @@ public class DistanceQuerySpec extends AbstractSearchQueryEvaluator {
 	public QueryModelNode removeQueryPatterns() {
 		final SingletonSet placeholder = new SingletonSet();
 
-		filter.replaceWith(filter.getArg());
+		replaceKeepingScope(filter, filter.getArg());
 
-		geoStatement.replaceWith(placeholder);
+		replaceKeepingScope(geoStatement, placeholder);
 
 		QueryModelNode functionParent = distanceFunction.getParentNode();
 		if (functionParent instanceof ExtensionElem) {
@@ -198,7 +203,7 @@ public class DistanceQuerySpec extends AbstractSearchQueryEvaluator {
 			if (elements.size() > 1) {
 				elements.remove(functionParent);
 			} else {
-				extension.replaceWith(extension.getArg());
+				replaceKeepingScope(extension, extension.getArg());
 			}
 		}
 

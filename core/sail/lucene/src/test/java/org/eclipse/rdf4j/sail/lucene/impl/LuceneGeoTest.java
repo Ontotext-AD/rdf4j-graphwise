@@ -18,16 +18,26 @@ import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import org.eclipse.rdf4j.common.iteration.CloseableIteration;
+import org.eclipse.rdf4j.common.iteration.CloseableIteratorIteration;
 import org.eclipse.rdf4j.model.IRI;
+import org.eclipse.rdf4j.model.Literal;
+import org.eclipse.rdf4j.model.Resource;
+import org.eclipse.rdf4j.model.Value;
+import org.eclipse.rdf4j.model.ValueFactory;
 import org.eclipse.rdf4j.model.base.CoreDatatype;
+import org.eclipse.rdf4j.model.datatypes.XMLDatatypeUtil;
 import org.eclipse.rdf4j.model.util.Values;
 import org.eclipse.rdf4j.query.BindingSet;
+import org.eclipse.rdf4j.query.Dataset;
 import org.eclipse.rdf4j.query.QueryResults;
 import org.eclipse.rdf4j.query.TupleQueryResult;
 import org.eclipse.rdf4j.query.algebra.BindingSetAssignment;
@@ -36,14 +46,24 @@ import org.eclipse.rdf4j.query.algebra.QueryRoot;
 import org.eclipse.rdf4j.query.algebra.StatementPattern;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.Var;
+import org.eclipse.rdf4j.query.algebra.evaluation.EvaluationStrategy;
+import org.eclipse.rdf4j.query.algebra.evaluation.TripleSource;
+import org.eclipse.rdf4j.query.algebra.evaluation.function.TupleFunction;
+import org.eclipse.rdf4j.query.algebra.evaluation.function.TupleFunctionRegistry;
+import org.eclipse.rdf4j.query.algebra.evaluation.impl.DefaultEvaluationStrategy;
+import org.eclipse.rdf4j.query.algebra.evaluation.impl.DefaultEvaluationStrategyFactory;
+import org.eclipse.rdf4j.query.algebra.evaluation.impl.EvaluationStatistics;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
+import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.sail.SailRepository;
 import org.eclipse.rdf4j.repository.util.Repositories;
 import org.eclipse.rdf4j.rio.RDFFormat;
 import org.eclipse.rdf4j.sail.evaluation.TupleFunctionEvaluationMode;
+import org.eclipse.rdf4j.sail.lucene.DistanceQuerySpec;
 import org.eclipse.rdf4j.sail.lucene.DocumentDistance;
 import org.eclipse.rdf4j.sail.lucene.LuceneSail;
+import org.eclipse.rdf4j.sail.lucene.LuceneSailSchema;
 import org.eclipse.rdf4j.sail.memory.MemoryStore;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
@@ -55,12 +75,249 @@ public class LuceneGeoTest {
 			PREFIX geo: <http://www.opengis.net/ont/geosparql#>
 			PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
 			PREFIX uom: <http://www.opengis.net/def/uom/OGC/1.0/>
+			PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 			""";
 	private static final String DISTANCE = "geof:distance('POINT(0 0)'^^geo:wktLiteral, ?wkt, uom:metre) < 1000";
 	private static final String INTERSECTS = "geof:sfIntersects('POINT(0 0)'^^geo:wktLiteral, ?wkt)";
 	private static final IRI LOCATION = Values.iri("urn:location");
+	private static final IRI SOURCE_LOCATION = Values.iri("urn:sourceLocation");
 	private static final IRI OTHER = Values.iri("urn:other");
 	private static final IRI NEAR = Values.iri("urn:near");
+	private static final IRI FAR = Values.iri("urn:far");
+	private static final String ORIGIN_VALUES = """
+			VALUES (?p ?origin) { (<urn:location> 'POINT(0 0)'^^geo:wktLiteral) }
+			""";
+
+	@TestFactory
+	Stream<DynamicTest> mappedGeometryFiltersPreserveMandatoryInputs() {
+		List<String> patterns = List.of(
+				"?s <urn:location> ?wkt FILTER(isIRI(?s))",
+				"{ ?s <urn:location> ?wkt FILTER(isIRI(?s)) }",
+				"?s <urn:location> ?wkt MINUS { ?s <urn:excluded> true }",
+				"{ ?s <urn:location> ?wkt FILTER(isIRI(?s)) } MINUS { ?s <urn:excluded> true }");
+		List<String> filters = List.of(DISTANCE,
+				"geof:ehContains('POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'^^geo:wktLiteral, ?wkt)");
+		return patterns.stream()
+				.flatMap(pattern -> filters.stream()
+						.map(filter -> dynamicTest(pattern + " FILTER(" + filter + ")", () -> {
+							var repository = mappedGeometryRepository(new RecordingIndex(),
+									TupleFunctionEvaluationMode.TRIPLE_SOURCE, new TupleFunctionRegistry());
+							try (var connection = repository.getConnection()) {
+								addGeometries(connection, SOURCE_LOCATION);
+								try (var rows = connection.prepareTupleQuery(PREFIXES + "SELECT ?s WHERE { "
+										+ pattern + " FILTER(" + filter + ") }").evaluate()) {
+									assertEquals(List.of(NEAR), rows.stream().map(row -> row.getValue("s")).toList());
+								}
+							} finally {
+								repository.shutDown();
+							}
+						})));
+	}
+
+	@TestFactory
+	Stream<DynamicTest> mappedGeometryUsesRegisteredRuntimeDistanceProvider() {
+		String simple = "VALUES ?limit { 1000 2000 } ?s <urn:location> ?wkt FILTER("
+				+ DISTANCE.replace("1000", "?limit") + ")";
+		String mixed = """
+				{
+					VALUES ?limit { 1000 2000 '1000' 'bad'^^xsd:double '255'^^xsd:byte 'NaN'^^xsd:double -1 UNDEF }
+					?s <urn:location> ?wkt
+					FILTER(%s)
+				}
+				""".formatted(DISTANCE.replace("1000", "?limit"));
+		List<BindingSet> expected = List.of(
+				distanceRow(NEAR, "1000", CoreDatatype.XSD.INTEGER),
+				distanceRow(NEAR, "2000", CoreDatatype.XSD.INTEGER));
+		return Stream.of(TupleFunctionEvaluationMode.values())
+				.flatMap(mode -> Stream.of(simple, mixed)
+						.map(pattern -> dynamicTest(mode + " " + pattern,
+								() -> assertRuntimeDistance(mode, pattern, SOURCE_LOCATION, expected))));
+	}
+
+	@TestFactory
+	Stream<DynamicTest> registeredDistanceProviderKeepsScalarFallback() {
+		String pattern = """
+				VALUES ?limit { 1000 2000 'INF'^^xsd:double 'invalid'^^xsd:double UNDEF }
+				?s <urn:location> ?wkt
+				FILTER(%s)
+				""".formatted(DISTANCE.replace("1000", "?limit"));
+		List<BindingSet> expected = List.of(
+				distanceRow(NEAR, "1000", CoreDatatype.XSD.INTEGER),
+				distanceRow(NEAR, "2000", CoreDatatype.XSD.INTEGER),
+				distanceRow(FAR, "INF", CoreDatatype.XSD.DOUBLE),
+				distanceRow(NEAR, "INF", CoreDatatype.XSD.DOUBLE));
+		return Stream.of(TupleFunctionEvaluationMode.values())
+				.map(mode -> dynamicTest(mode.name(), () -> assertRuntimeDistance(mode, pattern, LOCATION, expected)));
+	}
+
+	@TestFactory
+	Stream<DynamicTest> malformedDistanceOperandsAreRowErrorsWithAProvider() {
+		String origins = """
+				VALUES (?limit ?origin) {
+					(1000 'POINT(0 0)'^^geo:wktLiteral)
+					(2000 'not WKT'^^geo:wktLiteral)
+					(3000 'LINESTRING(0 0, 1 1)'^^geo:wktLiteral)
+				}
+				?s <urn:location> ?wkt
+				FILTER(geof:distance(?origin, ?wkt, uom:metre) < ?limit)
+				""";
+		String units = """
+				VALUES (?limit ?unit) { (1000 uom:metre) (2000 uom:kilometre) (3000 <urn:unknown-units>) }
+				?s <urn:location> ?wkt
+				FILTER(geof:distance('POINT(0 0)'^^geo:wktLiteral, ?wkt, ?unit) < ?limit)
+				""";
+		return Stream.of(TupleFunctionEvaluationMode.values())
+				.flatMap(mode -> Stream.of(origins, units)
+						.map(pattern -> dynamicTest(mode + " " + pattern, () -> assertRuntimeDistance(mode, pattern,
+								connection -> addGeometries(connection, LOCATION),
+								List.of(distanceRow(NEAR, "1000", CoreDatatype.XSD.INTEGER)), List.of(1000.0),
+								false))));
+	}
+
+	@TestFactory
+	Stream<DynamicTest> registeredDistanceProviderUsesTheActiveGraph() {
+		String pattern = """
+				GRAPH <urn:g1> {
+					VALUES ?limit { 1000 2000 }
+					?s <urn:location> ?wkt
+					FILTER(%s)
+				}
+				""".formatted(DISTANCE.replace("1000", "?limit"));
+		List<BindingSet> expected = List.of(
+				distanceRow(NEAR, "1000", CoreDatatype.XSD.INTEGER),
+				distanceRow(NEAR, "2000", CoreDatatype.XSD.INTEGER));
+		return Stream.of(TupleFunctionEvaluationMode.values())
+				.flatMap(mode -> Stream.of(LOCATION, SOURCE_LOCATION)
+						.map(property -> dynamicTest(mode + " " + property, () -> assertRuntimeDistance(mode, pattern,
+								connection -> {
+									var point = Values.literal("POINT(0 0)", CoreDatatype.GEO.WKT_LITERAL);
+									connection.add(NEAR, property, point, Values.iri("urn:g1"));
+									connection.add(OTHER, property, point, Values.iri("urn:g2"));
+								}, expected, List.of(1000.0, 2000.0), false))));
+	}
+
+	@Test
+	void nativeDistanceProviderUsesTheBaseRegistry() throws Exception {
+		assertRuntimeDistance(TupleFunctionEvaluationMode.NATIVE,
+				"VALUES ?limit { 1000 2000 } ?s <urn:location> ?wkt FILTER("
+						+ DISTANCE.replace("1000", "?limit") + ")",
+				connection -> addGeometries(connection, SOURCE_LOCATION),
+				List.of(distanceRow(NEAR, "1000", CoreDatatype.XSD.INTEGER),
+						distanceRow(NEAR, "2000", CoreDatatype.XSD.INTEGER)),
+				List.of(1000.0, 2000.0), true);
+	}
+
+	private static void assertRuntimeDistance(TupleFunctionEvaluationMode mode, String pattern, IRI property,
+			List<BindingSet> expected) throws Exception {
+		assertRuntimeDistance(mode, pattern, connection -> addGeometries(connection, property),
+				expected, List.of(1000.0, 2000.0), false);
+	}
+
+	private static void assertRuntimeDistance(TupleFunctionEvaluationMode mode, String pattern,
+			Consumer<RepositoryConnection> loadData, List<BindingSet> expected, List<Double> radii,
+			boolean privateNativeRegistry) throws Exception {
+		var index = new RecordingIndex();
+		var provider = new RecordingDistanceProvider(index);
+		var registry = mode == TupleFunctionEvaluationMode.TRIPLE_SOURCE || privateNativeRegistry
+				? new TupleFunctionRegistry()
+				: TupleFunctionRegistry.getInstance();
+		var previous = registry.add(provider);
+		MemoryStore base = new MemoryStore();
+		if (privateNativeRegistry) {
+			base.setEvaluationStrategyFactory(new DefaultEvaluationStrategyFactory() {
+				@Override
+				public EvaluationStrategy createEvaluationStrategy(Dataset dataset, TripleSource tripleSource,
+						EvaluationStatistics evaluationStatistics) {
+					return new DefaultEvaluationStrategy(tripleSource, dataset, getFederatedServiceResolver(),
+							getQuerySolutionCacheThreshold(), evaluationStatistics, isTrackResultSize(), registry);
+				}
+			});
+		}
+		try {
+			var repository = mappedGeometryRepository(base, index, mode,
+					privateNativeRegistry ? TupleFunctionRegistry.getInstance() : registry);
+			try (var connection = repository.getConnection()) {
+				loadData.accept(connection);
+				try (var rows = connection.prepareTupleQuery(PREFIXES
+						+ "SELECT ?s ?limit WHERE { " + pattern + " } ORDER BY ?limit ?s").evaluate()) {
+					assertEquals(expected, rows.stream().toList());
+				}
+				assertEquals(radii, provider.radii.stream().sorted().toList());
+			} finally {
+				repository.shutDown();
+			}
+		} finally {
+			registry.remove(provider);
+			previous.ifPresent(registry::add);
+		}
+	}
+
+	private static SailRepository mappedGeometryRepository(RecordingIndex index, TupleFunctionEvaluationMode mode,
+			TupleFunctionRegistry registry) throws Exception {
+		return mappedGeometryRepository(new MemoryStore(), index, mode, registry);
+	}
+
+	private static SailRepository mappedGeometryRepository(MemoryStore base, RecordingIndex index,
+			TupleFunctionEvaluationMode mode, TupleFunctionRegistry registry) throws Exception {
+		Properties parameters = new Properties();
+		parameters.setProperty(LuceneSail.LUCENE_RAMDIR_KEY, "true");
+		parameters.setProperty(LuceneSail.WKT_FIELDS, LOCATION.stringValue());
+		index.initialize(parameters);
+		LuceneSail sail = new LuceneSail();
+		sail.setBaseSail(base);
+		sail.setLuceneIndex(index);
+		sail.setEvaluationMode(mode);
+		sail.setTupleFunctionRegistry(registry);
+		sail.setParameter(LuceneSail.INDEXEDFIELDS, "index.1=urn:location\nurn\\:sourceLocation=urn:location");
+		SailRepository repository = new SailRepository(sail);
+		repository.init();
+		return repository;
+	}
+
+	private static void addGeometries(RepositoryConnection connection, IRI property) {
+		connection.add(NEAR, property, Values.literal("POINT(0 0)", CoreDatatype.GEO.WKT_LITERAL));
+		connection.add(FAR, property, Values.literal("POINT(10 10)", CoreDatatype.GEO.WKT_LITERAL));
+	}
+
+	private static BindingSet distanceRow(IRI subject, String limit, CoreDatatype.XSD datatype) {
+		var row = new MapBindingSet();
+		row.addBinding("s", subject);
+		row.addBinding("limit", Values.literal(limit, datatype));
+		return row;
+	}
+
+	private static final class RecordingDistanceProvider implements TupleFunction {
+		private final RecordingIndex index;
+		private final List<Double> radii = new ArrayList<>();
+
+		private RecordingDistanceProvider(RecordingIndex index) {
+			this.index = index;
+		}
+
+		@Override
+		public String getURI() {
+			return LuceneSailSchema.WITHIN_DISTANCE.stringValue();
+		}
+
+		@Override
+		public CloseableIteration<? extends List<? extends Value>> evaluate(ValueFactory factory, Value... args) {
+			var origin = (Literal) args[0];
+			var radius = (Literal) args[1];
+			var datatype = radius.getCoreDatatype().asXSDDatatypeOrNull();
+			assertTrue(datatype.isNumericDatatype() && XMLDatatypeUtil.isValidValue(radius.getLabel(), datatype));
+			double distance = radius.doubleValue();
+			assertTrue(Double.isFinite(distance) && distance >= 0);
+			radii.add(distance);
+			Var context = args.length == 5 ? Var.of("context", (Resource) args[4], true, true) : null;
+			var spec = new DistanceQuerySpec(origin, (IRI) args[2], distance, null, (IRI) args[3], "wkt", "s",
+					context);
+			List<List<Value>> matches = index.evaluate(spec)
+					.stream()
+					.map(row -> List.of(row.getValue("s"), row.getValue("wkt")))
+					.toList();
+			return new CloseableIteratorIteration<>(matches.iterator());
+		}
+	}
 
 	@TestFactory
 	Stream<DynamicTest> geometryPredicatesKeepVariableResults() {
@@ -85,6 +342,55 @@ public class LuceneGeoTest {
 										mode + " " + test.name() + " " + filter,
 										() -> assertGeometryRows(mode, test.pattern().formatted(filter),
 												test.expected())))));
+	}
+
+	@TestFactory
+	Stream<DynamicTest> geometryFiltersApplyAcrossUnionAndOptional() {
+		var cases = List.of(
+				new GeometryCase("UNION", """
+						{ ?s <urn:location> ?wkt } UNION { VALUES ?s { <urn:missing> } }
+						FILTER(%s)
+						""", List.of(row(NEAR, LOCATION))),
+				new GeometryCase("OPTIONAL", """
+						VALUES ?s { <urn:near> <urn:missing> }
+						OPTIONAL { ?s <urn:location> ?wkt }
+						FILTER(%s)
+						""", List.of(row(NEAR, LOCATION))),
+				new GeometryCase("nested UNION and OPTIONAL", """
+						{ ?s <urn:location> ?wkt }
+						UNION { VALUES ?s { <urn:missing> } OPTIONAL { ?s <urn:location> ?wkt } }
+						FILTER(%s)
+						""", List.of(row(NEAR, LOCATION))));
+		return Stream.of("geof:distance(?origin, ?wkt, uom:metre) < 1000", "geof:sfIntersects(?origin, ?wkt)")
+				.flatMap(filter -> cases.stream()
+						.flatMap(test -> Stream.of(TupleFunctionEvaluationMode.values())
+								.map(mode -> dynamicTest(
+										mode + " " + test.name() + " " + filter,
+										() -> assertGeometryRows(mode, ORIGIN_VALUES + test.pattern().formatted(filter),
+												test.expected())))));
+	}
+
+	@TestFactory
+	Stream<DynamicTest> distanceFiltersKeepInvalidValuesThresholdsInSparql() {
+		var cases = List.of(
+				new GeometryCase("nonnumeric string", "VALUES ?limit { 'not a number' } FILTER(%s < ?limit)",
+						List.of()),
+				new GeometryCase("numeric string", "VALUES ?limit { '1000' } FILTER(%s < ?limit)", List.of()),
+				new GeometryCase("inline numeric string", "FILTER(%s < '1000')", List.of()),
+				new GeometryCase("malformed typed literal", "VALUES ?limit { 'bad'^^xsd:double } FILTER(%s < ?limit)",
+						List.of()),
+				new GeometryCase("NaN", "VALUES ?limit { 'NaN'^^xsd:double } FILTER(%s < ?limit)", List.of()),
+				new GeometryCase("negative", "VALUES ?limit { -1000 } FILTER(%s < ?limit)", List.of()),
+				new GeometryCase("IRI", "VALUES ?limit { <urn:invalid> } FILTER(%s < ?limit)", List.of()),
+				new GeometryCase("mixed VALUES", "VALUES ?limit { 'bad' UNDEF 1000 } FILTER(%s < ?limit)",
+						List.of(row(NEAR, LOCATION))));
+		return cases.stream()
+				.flatMap(test -> Stream.of(TupleFunctionEvaluationMode.values())
+						.map(mode -> dynamicTest(
+								mode + " " + test.name(),
+								() -> assertGeometryRows(mode, ORIGIN_VALUES + "?s <urn:location> ?wkt "
+										+ test.pattern().formatted("geof:distance(?origin, ?wkt, uom:metre)"),
+										test.expected()))));
 	}
 
 	private static void assertGeometryRows(TupleFunctionEvaluationMode mode, String pattern,

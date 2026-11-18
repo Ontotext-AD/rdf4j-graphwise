@@ -90,10 +90,11 @@ public final class BoundFilterUtil {
 		if (required == null || required.isEmpty()) {
 			return Optional.of(input);
 		}
-		QueryBindingSet merged = new QueryBindingSet(input);
+		QueryBindingSet merged = QueryAlgebraUtil.copyBindings(input);
 		for (Binding binding : required) {
 			String name = binding.getName();
-			if (merged.hasBinding(name) && !merged.getValue(name).equals(binding.getValue())) {
+			Value inputValue = merged.getValue(name);
+			if (inputValue != null && !inputValue.equals(binding.getValue())) {
 				return Optional.empty();
 			}
 			merged.setBinding(name, binding.getValue());

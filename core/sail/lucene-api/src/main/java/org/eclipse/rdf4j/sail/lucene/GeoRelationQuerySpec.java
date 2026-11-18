@@ -49,6 +49,10 @@ public class GeoRelationQuerySpec extends AbstractSearchQueryEvaluator {
 		this.functionParent = functionParent;
 	}
 
+	QueryModelNode getFunctionParent() {
+		return functionParent;
+	}
+
 	public void setQueryGeometry(Literal shape) {
 		this.qshape = shape;
 	}
@@ -111,9 +115,9 @@ public class GeoRelationQuerySpec extends AbstractSearchQueryEvaluator {
 	public QueryModelNode removeQueryPatterns() {
 		final SingletonSet placeholder = new SingletonSet();
 
-		filter.replaceWith(filter.getArg());
+		replaceKeepingScope(filter, filter.getArg());
 
-		geoStatement.replaceWith(placeholder);
+		replaceKeepingScope(geoStatement, placeholder);
 
 		if (functionParent instanceof ExtensionElem) {
 			Extension extension = (Extension) functionParent.getParentNode();
@@ -121,7 +125,7 @@ public class GeoRelationQuerySpec extends AbstractSearchQueryEvaluator {
 			if (elements.size() > 1) {
 				elements.remove(functionParent);
 			} else {
-				extension.replaceWith(extension.getArg());
+				replaceKeepingScope(extension, extension.getArg());
 			}
 		}
 
