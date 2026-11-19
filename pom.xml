@@ -50,6 +50,9 @@
 	</modules>
 	<properties>
 		<java.version>25</java.version>
+		<!-- Ontotext repos -->
+		<internal.repo>https://maven.ontotext.com/content/repositories/owlim-releases</internal.repo>
+		<snapshots.repo>https://maven.ontotext.com/content/repositories/owlim-snapshots</snapshots.repo>
 		<maven.compiler.release>${java.version}</maven.compiler.release>
 		<maven.compiler.source>${java.version}</maven.compiler.source>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -1462,4 +1465,16 @@
 		<developerConnection>scm:git:git@github.com:eclipse/rdf4j.git</developerConnection>
 		<url>https://github.com/eclipse/rdf4j</url>
 	</scm>
+	<distributionManagement>
+		<repository>
+			<id>internal</id>
+			<name>OWLIM Releases repository</name>
+			<url>${internal.repo}</url>
+		</repository>
+		<snapshotRepository>
+			<id>snapshots</id>
+			<name>OWLIM Snapshots repository</name>
+			<url>${snapshots.repo}</url>
+		</snapshotRepository>
+	</distributionManagement>
 </project>
