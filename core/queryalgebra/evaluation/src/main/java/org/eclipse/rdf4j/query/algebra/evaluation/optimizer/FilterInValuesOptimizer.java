@@ -12,6 +12,7 @@
 package org.eclipse.rdf4j.query.algebra.evaluation.optimizer;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -28,7 +29,10 @@ import org.eclipse.rdf4j.query.algebra.EmptySet;
 import org.eclipse.rdf4j.query.algebra.Filter;
 import org.eclipse.rdf4j.query.algebra.Join;
 import org.eclipse.rdf4j.query.algebra.ListMemberOperator;
+import org.eclipse.rdf4j.query.algebra.QueryModelNode;
 import org.eclipse.rdf4j.query.algebra.SameTerm;
+import org.eclipse.rdf4j.query.algebra.StatementPattern;
+import org.eclipse.rdf4j.query.algebra.SubQueryValueOperator;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.ValueConstant;
 import org.eclipse.rdf4j.query.algebra.ValueExpr;
@@ -68,12 +72,66 @@ final class FilterInValuesOptimizer implements QueryOptimizer {
 				return;
 			}
 
+			if (scansBoundSubject(filter, assignment)) {
+				return;
+			}
+
 			if (mergeWithExistingValuesAnchor(filter, assignment)) {
 				return;
 			}
 
 			filter.replaceWith(new Join(assignment, filter.getArg().clone()));
 		}
+	}
+
+	/**
+	 * A statement pattern whose subject is already bound (by a constant or by the outer row of a correlated EXISTS)
+	 * only reads that subject's statements. Scanning them and testing the values is cheaper than a VALUES anchor on the
+	 * outer side, which looks up the listed values one by one until one matches, through a join that is rebuilt for
+	 * every input row. A single value is still anchored: its one lookup is fully bound.
+	 */
+	private static boolean scansBoundSubject(Filter filter, BindingSetAssignment assignment) {
+		if (!(filter.getArg()instanceof StatementPattern pattern) || !hasMultipleRows(assignment)) {
+			return false;
+		}
+		Var subject = pattern.getSubjectVar();
+		if (subject.hasValue()) {
+			return true;
+		}
+		if (subject.getName() == null || assignment.getBindingNames().contains(subject.getName())) {
+			return false;
+		}
+		return isBoundByOuterScope(filter, subject.getName());
+	}
+
+	/**
+	 * Whether the filter sits inside an EXISTS subquery whose enclosing tuple expression assuredly binds the variable.
+	 */
+	private static boolean isBoundByOuterScope(Filter filter, String name) {
+		QueryModelNode node = filter.getParentNode();
+		while (node != null) {
+			if (node instanceof SubQueryValueOperator) {
+				QueryModelNode outer = node.getParentNode();
+				while (outer != null && !(outer instanceof TupleExpr)) {
+					outer = outer.getParentNode();
+				}
+				if (outer instanceof Filter outerFilter) {
+					return outerFilter.getArg().getAssuredBindingNames().contains(name);
+				}
+				return false;
+			}
+			node = node.getParentNode();
+		}
+		return false;
+	}
+
+	private static boolean hasMultipleRows(BindingSetAssignment assignment) {
+		Iterator<BindingSet> rows = assignment.getBindingSets().iterator();
+		if (!rows.hasNext()) {
+			return false;
+		}
+		rows.next();
+		return rows.hasNext();
 	}
 
 	private static boolean isScopeBoundary(Filter filter) {
