@@ -315,7 +315,7 @@ public final class RemoteBNode extends SimpleBNode {
 		}
 
 		public BindingSet map(BindingSet row, BindingSet originalBindings) {
-			return mapValues(row, (name, value) -> map(value,
+			return BindingSetSnapshots.mapValues(row, (name, value) -> map(value,
 					originalBindings == null ? null : originalBindings.getValue(name)));
 		}
 
@@ -324,7 +324,7 @@ public final class RemoteBNode extends SimpleBNode {
 			if (canonicalOriginals.isEmpty()) {
 				return row;
 			}
-			return mapValues(originalBindings(row), (name, value) -> rewriteAliases(value, null,
+			return BindingSetSnapshots.mapValues(originalBindings(row), (name, value) -> rewriteAliases(value, null,
 					(term, ignored) -> markCallerAlias(name, term, value)));
 		}
 
@@ -367,7 +367,7 @@ public final class RemoteBNode extends SimpleBNode {
 			if (canonicalOriginals.isEmpty()) {
 				return row;
 			}
-			return mapValues(row, (name, value) -> {
+			return BindingSetSnapshots.mapValues(row, (name, value) -> {
 				Value original = originalBindings == null ? markedOriginalBinding(name, value)
 						: originalBindings.getValue(name);
 				return rewriteAliases(value, original,
@@ -391,24 +391,6 @@ public final class RemoteBNode extends SimpleBNode {
 				}
 			}
 			return value;
-		}
-
-		private static BindingSet mapValues(BindingSet row, BiFunction<String, Value, Value> mapper) {
-			MapBindingSet mapped = null;
-			for (String name : row.getBindingNames()) {
-				Value value = row.getValue(name);
-				Value replacement = mapper.apply(name, value);
-				if (replacement != value) {
-					if (mapped == null) {
-						mapped = new MapBindingSet(row.size());
-						for (String bindingName : row.getBindingNames()) {
-							mapped.addBinding(bindingName, row.getValue(bindingName));
-						}
-					}
-					mapped.setBinding(name, replacement);
-				}
-			}
-			return mapped == null ? row : BindingSetSnapshots.preserveMetadata(row, mapped);
 		}
 
 		public Value map(Value value, Value original) {

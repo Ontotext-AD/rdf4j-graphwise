@@ -66,7 +66,7 @@ public class QueryRoot extends UnaryTupleOperator {
 		}
 		if (other instanceof QueryRoot) {
 			QueryRoot o = (QueryRoot) other;
-			return super.equals(o);
+			return hasUntrackedServiceRewrite() == o.hasUntrackedServiceRewrite() && super.equals(o);
 		}
 		return false;
 	}

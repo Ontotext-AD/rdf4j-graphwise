@@ -28,18 +28,21 @@ import org.eclipse.rdf4j.model.Value;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.Dataset;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
+import org.eclipse.rdf4j.query.algebra.AbstractQueryModelNode;
 import org.eclipse.rdf4j.query.algebra.Difference;
 import org.eclipse.rdf4j.query.algebra.Exists;
 import org.eclipse.rdf4j.query.algebra.Extension;
 import org.eclipse.rdf4j.query.algebra.ExtensionElem;
 import org.eclipse.rdf4j.query.algebra.Filter;
 import org.eclipse.rdf4j.query.algebra.GroupElem;
+import org.eclipse.rdf4j.query.algebra.LeftJoin;
 import org.eclipse.rdf4j.query.algebra.MultiProjection;
 import org.eclipse.rdf4j.query.algebra.OrderElem;
 import org.eclipse.rdf4j.query.algebra.Projection;
 import org.eclipse.rdf4j.query.algebra.ProjectionElem;
 import org.eclipse.rdf4j.query.algebra.ProjectionElemList;
 import org.eclipse.rdf4j.query.algebra.QueryModelNode;
+import org.eclipse.rdf4j.query.algebra.QueryRoot;
 import org.eclipse.rdf4j.query.algebra.Service;
 import org.eclipse.rdf4j.query.algebra.SubQueryValueOperator;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
@@ -62,6 +65,8 @@ import org.eclipse.rdf4j.query.impl.ListBindingSet;
  */
 @InternalUseOnly
 public final class PreparedQueryBindingPlan {
+	private static final Object RUNTIME_SERVICE_ORIGIN = new Object();
+
 	public enum Mode {
 		RUNTIME_INPUT,
 		QUERY_PARAMETERS,
@@ -81,6 +86,11 @@ public final class PreparedQueryBindingPlan {
 	@FunctionalInterface
 	public interface ServiceReadValidator {
 		Set<String> possibleReads(Service service, BindingSet parameters);
+
+		/** Checks the column layout used to route results from the saved request. */
+		default boolean preservesOutputBindings(Service service, BindingSet parameters) {
+			return false;
+		}
 	}
 
 	public record Replacement(Var variable, Value value, boolean substitutedTerm) {
@@ -202,8 +212,15 @@ public final class PreparedQueryBindingPlan {
 	private static void rejectAlreadyPreparedServices(TupleExpr tupleExpr) {
 		tupleExpr.visit(new AbstractQueryModelVisitor<RuntimeException>() {
 			@Override
+			protected void meetNode(QueryModelNode node) {
+				checkServiceRewrite(node);
+				QueryAlgebraBindingAnalysis.visitBindingChildren(node, this);
+			}
+
+			@Override
 			public void meet(Service service) {
-				if (!service.getPreparedInputBindings().isEmpty()
+				if (!service.permitsPreparedReads(Set.of()) || !service.getPreparedInputBindings().isEmpty()
+						|| !service.getRuntimeEndpointBindings().isEmpty()
 						|| !service.getRuntimeBindingHistory().values().isEmpty()
 						|| !service.getRuntimeBindingHistory().conflicts().isEmpty()) {
 					throw new UnsupportedPreparedBindings("Cannot recapture an already prepared SERVICE");
@@ -216,6 +233,179 @@ public final class PreparedQueryBindingPlan {
 				if (variable.hasValue() && variable.hasApiInputOrigin() && withinSavedServiceBody(variable)) {
 					throw new UnsupportedPreparedBindings("Cannot recover a previously assigned SERVICE input");
 				}
+			}
+		});
+	}
+
+	private static void checkServiceRewrite(QueryModelNode node) {
+		if (node instanceof AbstractQueryModelNode model && model.hasUntrackedServiceRewrite()) {
+			throw new UnsupportedPreparedBindings("Cannot prepare a query with an untracked runtime SERVICE rewrite");
+		}
+	}
+
+	/** Tracks exact SERVICE occurrences across one ordinary optimizer. Normal model clones carry the token. */
+	public static TupleExpr trackRuntimeServiceRewrites(TupleExpr root, BindingSet input, Runnable optimizer) {
+		Map<Object, ServiceSource> origins = new IdentityHashMap<>();
+		Map<Service, Object> originalNodes = new IdentityHashMap<>();
+		QueryAlgebraBindingAnalysis analysis = null;
+		for (Service service : serviceNodes(root)) {
+			Object origin = service.getQueryModelMetadata(RUNTIME_SERVICE_ORIGIN);
+			if (origin == null || origins.containsKey(origin)) {
+				// Two separately present clones are distinct occurrences at the start of this invocation.
+				origin = new Object();
+				service.setQueryModelMetadata(RUNTIME_SERVICE_ORIGIN, origin);
+			}
+			Var selector = service.getServiceRef();
+			Value parameter = null;
+			String name = selector.getName();
+			if (!selector.hasValue() && name != null && input != null && input.getValue(name) != null) {
+				if (analysis == null) {
+					analysis = QueryAlgebraBindingAnalysis.withBindingValues(root, input);
+				}
+				ReadOnlyContext scope = analysis.contextAt(selector);
+				parameter = scopedEndpointParameter(scope, name);
+			}
+			origins.put(origin, new ServiceSource(service.getAskQueryString(), service.getBaseURI(), selector.clone(),
+					parameter));
+			originalNodes.put(service, origin);
+		}
+		try {
+			optimizer.run();
+		} catch (RuntimeException | Error failure) {
+			try {
+				checkRuntimeServiceRewrites(root, origins, originalNodes);
+			} catch (RuntimeException | Error auditFailure) {
+				if (auditFailure != failure) {
+					failure.addSuppressed(auditFailure);
+				}
+			}
+			throw failure;
+		}
+		return checkRuntimeServiceRewrites(root, origins, originalNodes);
+	}
+
+	private static Value scopedEndpointParameter(ReadOnlyContext scope, String name) {
+		Value external = scope.externalValues().get(name);
+		return scope.bindingDomainKnown() && scope.externalGuaranteedNames().contains(name)
+				&& external != null && external.equals(scope.fixedValues().get(name)) ? external : null;
+	}
+
+	private record ServiceSource(String request, String baseURI, Var selector, Value parameter) {
+		boolean preserve(Service service) {
+			if (!request.equals(service.getAskQueryString()) || !Objects.equals(baseURI, service.getBaseURI())) {
+				return false;
+			}
+			Var current = service.getServiceRef();
+			if (selector.equals(current) && selector.hasApiInputOrigin() == current.hasApiInputOrigin()
+					&& selector.isConstant() == current.isConstant() && selector.isBNode() == current.isBNode()
+					&& selector.isVariableScopeChange() == current.isVariableScopeChange()) {
+				return true;
+			}
+			// Keep the optimizer's selector intact. The owning occurrence carries its proven public input,
+			// including when a later optimizer uses a different internal name for the same fixed endpoint.
+			if (parameter != null && parameter.equals(current.getValue())) {
+				service.recordRuntimeEndpointBinding(selector.getName(), parameter);
+				return true;
+			}
+			if (selector.hasValue() && selector.getValue().equals(current.getValue())) {
+				if (!service.getRuntimeEndpointBindings().isEmpty()) {
+					return true;
+				}
+				if (selector.hasApiInputOrigin()) {
+					service.recordRuntimeEndpointBinding(selector.getName(), selector.getValue());
+					return true;
+				}
+			}
+			return false;
+		}
+	}
+
+	private static TupleExpr checkRuntimeServiceRewrites(TupleExpr root, Map<Object, ServiceSource> origins,
+			Map<Service, Object> originalNodes) {
+		Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+		boolean untracked = false;
+		try {
+			for (Service service : serviceNodes(root)) {
+				Object origin = originalNodes.getOrDefault(service,
+						service.getQueryModelMetadata(RUNTIME_SERVICE_ORIGIN));
+				ServiceSource source = origins.get(origin);
+				if (source != null && source.preserve(service)) {
+					seen.add(origin);
+				} else {
+					service.markUntrackedServiceRewrite();
+					untracked = true;
+				}
+			}
+		} catch (RuntimeException | Error failure) {
+			if (root instanceof AbstractQueryModelNode owner) {
+				owner.markUntrackedServiceRewrite();
+			}
+			throw failure;
+		}
+		if (untracked || seen.size() != origins.size()) {
+			// A rewritten SERVICE may already have changed a filter or projection outside its subtree.
+			if (root instanceof AbstractQueryModelNode owner) {
+				owner.markUntrackedServiceRewrite();
+				return root;
+			}
+			QueryRoot owner = new QueryRoot(root);
+			owner.markUntrackedServiceRewrite();
+			return owner;
+		}
+		return root;
+	}
+
+	private static Set<Service> serviceNodes(TupleExpr root) {
+		Set<Service> services = Collections.newSetFromMap(new IdentityHashMap<>());
+		root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+			@Override
+			protected void meetNode(QueryModelNode node) {
+				QueryAlgebraBindingAnalysis.visitBindingChildren(node, this);
+			}
+
+			@Override
+			public void meet(Service service) {
+				services.add(service);
+				super.meet(service);
+			}
+		});
+		return services;
+	}
+
+	/** Closes the set of SERVICE parameters before ordinary optimizers can erase reads or fold dependent callers. */
+	public static void recordRuntimeOptimization(TupleExpr root) {
+		root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+			@Override
+			protected void meetNode(QueryModelNode node) {
+				QueryAlgebraBindingAnalysis.visitBindingChildren(node, this);
+			}
+
+			@Override
+			public void meet(Service service) {
+				var history = service.getRuntimeBindingHistory().values();
+				if (history.isEmpty()) {
+					service.recordRuntimeOptimization(Set.of());
+				} else {
+					var specialized = new HashSet<>(history.keySet());
+					service.getServiceExpr().visit(new AbstractQueryModelVisitor<RuntimeException>() {
+						@Override
+						protected void meetNode(QueryModelNode node) {
+							QueryAlgebraBindingAnalysis.visitBindingChildren(node, this);
+						}
+
+						@Override
+						public void meet(Var variable) {
+							String name = variable.getName();
+							// A matching input name in another arm cannot vouch for this occurrence.
+							if (!variable.hasApiInputOrigin()
+									|| !Objects.equals(variable.getValue(), history.get(name))) {
+								specialized.remove(name);
+							}
+						}
+					});
+					service.recordRuntimeOptimization(specialized);
+				}
+				super.meet(service);
 			}
 		});
 	}
@@ -260,6 +450,9 @@ public final class PreparedQueryBindingPlan {
 		}
 
 		private boolean visit(QueryModelNode node, ReadOnlyContext context) {
+			if (captureForEmptyRows) {
+				checkServiceRewrite(node);
+			}
 			if (node instanceof TupleExpr tuple) {
 				boolean knownContract = analysis.hasKnownBindingContract(tuple);
 				if (!knownContract || !context.bindingDomainKnown()) {
@@ -298,15 +491,6 @@ public final class PreparedQueryBindingPlan {
 								&& !history.savedQuery().equals(service.getAskQueryString())) {
 							throw unsupportedBindings(service);
 						}
-						if (!history.values().isEmpty()) {
-							Set<String> newReads = new HashSet<>(validator.possibleReads(service,
-									serviceParameters(context)));
-							newReads.removeAll(history.values().keySet());
-							if (!newReads.isEmpty()) {
-								// An already rewritten body cannot prove how a newly introduced input would affect it.
-								throw unsupportedBindings(service);
-							}
-						}
 						for (var entry : history.values().entrySet()) {
 							if (!context.externalGuaranteedNames().contains(entry.getKey())
 									|| !entry.getValue().equals(context.externalValues().get(entry.getKey()))) {
@@ -323,6 +507,18 @@ public final class PreparedQueryBindingPlan {
 				return false;
 			}
 			if (!(node instanceof Var var)) {
+				return true;
+			}
+			if (captureForEmptyRows && var.getParentNode() instanceof Service service && service.getServiceRef() == var
+					&& !service.getRuntimeEndpointBindings().isEmpty()) {
+				service.getRuntimeEndpointBindings().forEach((name, endpoint) -> {
+					if (!endpoint.equals(var.getValue()) || !endpoint.equals(scopedEndpointParameter(context, name))) {
+						throw new UnsupportedPreparedBindings(
+								"Cannot preserve the previously specialized SERVICE endpoint");
+					}
+					captureServiceInput(var, name, endpoint);
+					captureProjectionInput(var, name, endpoint);
+				});
 				return true;
 			}
 			if (captureForEmptyRows && var.hasValue() && var.hasApiInputOrigin() && hasUntrackedServiceOrigin(var)) {
@@ -350,11 +546,11 @@ public final class PreparedQueryBindingPlan {
 					}
 					replacements.add(new Replacement(var, value, substitutedTerm(var)));
 					if (captureForEmptyRows) {
-						captureServiceInput(var, value);
+						captureServiceInput(var, var.getName(), value);
 					} else {
 						recordServiceBinding(var, value);
 					}
-					captureProjectionInput(var, value);
+					captureProjectionInput(var, var.getName(), value);
 				}
 				return true;
 			}
@@ -365,12 +561,12 @@ public final class PreparedQueryBindingPlan {
 					&& value.equals(context.fixedValues().get(var.getName()))) {
 				replacements.add(new Replacement(var, value, substitutedTerm(var)));
 				if (captureForEmptyRows) {
-					captureServiceInput(var, value);
+					captureServiceInput(var, var.getName(), value);
 				} else {
 					recordServiceBinding(var, value);
 				}
 				if (logicalParameters) {
-					captureProjectionInput(var, value);
+					captureProjectionInput(var, var.getName(), value);
 				}
 			} else if (captureForEmptyRows && value != null) {
 				if (requireAssignment) {
@@ -425,12 +621,18 @@ public final class PreparedQueryBindingPlan {
 		}
 
 		/** A projection recovers only an API expression read belonging to its own result scope. */
-		private void captureProjectionInput(Var variable, Value value) {
-			QueryModelNode directParent = variable.getParentNode();
-			boolean expressionRead = directParent instanceof ValueExpr || directParent instanceof ExtensionElem
-					|| directParent instanceof GroupElem || directParent instanceof OrderElem
-					|| directParent instanceof Filter filter && filter.getCondition() == variable
-					|| directParent instanceof TupleFunctionCall function && function.getArgs().contains(variable);
+		private void captureProjectionInput(Var variable, String name, Value value) {
+			// A bare Var in a scalar slot is the entire expression. Relational variables, including a tuple
+			// function's result slots, are produced or constrained by their operator instead.
+			boolean expressionRead = switch (variable.getParentNode()) {
+			case ValueExpr _,ExtensionElem _,GroupElem _,OrderElem _ -> true;
+			case Filter filter -> filter.getCondition() == variable;
+			case LeftJoin optional -> optional.getCondition() == variable;
+			case Service service -> service.getServiceRef() == variable;
+			case TupleFunctionCall call -> call.getArgumentGuard() == variable
+					|| call.getArgs().stream().anyMatch(argument -> argument == variable);
+			case null, default -> false;
+			};
 			if (!expressionRead) {
 				return;
 			}
@@ -450,12 +652,11 @@ public final class PreparedQueryBindingPlan {
 				}
 				child = parent;
 			}
-			if (projection == null || !projectsSource(projection, variable.getName())) {
+			if (projection == null || !projectsSource(projection, name)) {
 				return;
 			}
 			ReadOnlyContext input = analysis.contextAt(projection);
-			if (!input.externalGuaranteedNames().contains(variable.getName())
-					|| !value.equals(input.externalValues().get(variable.getName()))) {
+			if (!input.externalGuaranteedNames().contains(name) || !value.equals(input.externalValues().get(name))) {
 				return;
 			}
 			Map<String, Value> names = projectionInputs.get(projection);
@@ -463,7 +664,7 @@ public final class PreparedQueryBindingPlan {
 				names = new LinkedHashMap<>();
 				projectionInputs.put(projection, names);
 			}
-			names.put(variable.getName(), value);
+			names.put(name, value);
 		}
 
 		private boolean projectsSource(UnaryTupleOperator projection, String name) {
@@ -514,7 +715,7 @@ public final class PreparedQueryBindingPlan {
 				return;
 			}
 			List<QueryModelNode> children = new ArrayList<>();
-			node.visitChildren(new AbstractQueryModelVisitor<RuntimeException>() {
+			QueryAlgebraBindingAnalysis.visitBindingChildren(node, new AbstractQueryModelVisitor<RuntimeException>() {
 				@Override
 				protected void meetNode(QueryModelNode child) {
 					children.add(child);
@@ -536,19 +737,19 @@ public final class PreparedQueryBindingPlan {
 			}
 		}
 
-		private void captureServiceInput(Var variable, Value value) {
+		private void captureServiceInput(Var variable, String name, Value value) {
 			QueryModelNode child = variable;
 			for (QueryModelNode parent = child.getParentNode(); parent != null; parent = child.getParentNode()) {
 				if (parent instanceof Service service && child == service.getServiceExpr()
 						&& serviceContexts.containsKey(service)) {
 					ReadOnlyContext input = serviceContexts.get(service);
-					Value parameter = input.externalValues().get(variable.getName());
+					Value parameter = input.externalValues().get(name);
 					if (parameter != null) {
-						if (!input.externalGuaranteedNames().contains(variable.getName()) || !parameter.equals(value)) {
+						if (!input.externalGuaranteedNames().contains(name) || !parameter.equals(value)) {
 							throw unsupportedBindings(service);
 						}
 						serviceInputs.computeIfAbsent(service, ignored -> new LinkedHashMap<>())
-								.put(variable.getName(), value);
+								.put(name, value);
 					}
 				}
 				child = parent;
@@ -565,10 +766,25 @@ public final class PreparedQueryBindingPlan {
 		}
 
 		private void validateServiceInputs() {
-			serviceInputs.forEach((service, captured) -> {
-				if (!validator.possibleReads(service, serviceParameters(serviceContexts.get(service)))
-						.containsAll(captured.keySet())) {
-					throw new UnsupportedPreparedBindings("Saved SERVICE text does not read a captured input");
+			serviceContexts.forEach((service, context) -> {
+				Set<String> captured = serviceInputs.getOrDefault(service, Map.of()).keySet();
+				BindingSet parameters = serviceParameters(context);
+				Set<String> sourceReads = validator.possibleReads(service, parameters);
+				if (!service.permitsPreparedReads(sourceReads)) {
+					throw new UnsupportedPreparedBindings("SERVICE was optimized without all prepared inputs");
+				}
+				if (!sourceReads.equals(captured)) {
+					// The endpoint executes the saved source, but local request planning uses the algebra's
+					// outputs. A read erased from the algebra can change both the rows and their output columns.
+					throw new UnsupportedPreparedBindings("Saved SERVICE reads differ from captured algebra inputs");
+				}
+				Map<String, Value> history = service.getRuntimeBindingHistory().values();
+				if (!history.isEmpty() && !history.keySet().containsAll(sourceReads)) {
+					// An already rewritten body cannot prove how a newly introduced input would affect it.
+					throw unsupportedBindings(service);
+				}
+				if (!sourceReads.isEmpty() && !validator.preservesOutputBindings(service, parameters)) {
+					throw new UnsupportedPreparedBindings("Saved SERVICE outputs differ from the prepared algebra");
 				}
 			});
 		}
@@ -579,7 +795,7 @@ public final class PreparedQueryBindingPlan {
 		}
 
 		private PreparedQueryBindingPlan build() {
-			if (logicalParameters) {
+			if (!projectionInputs.isEmpty()) {
 				planProjectionRecoveries();
 			}
 			return new PreparedQueryBindingPlan(replacements, projectionRecoveries, serviceInputs,

@@ -14,10 +14,13 @@ package org.eclipse.rdf4j.query.impl;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.BiFunction;
 
 import org.eclipse.rdf4j.common.annotation.InternalUseOnly;
 import org.eclipse.rdf4j.model.Value;
@@ -50,11 +53,41 @@ public final class BindingSetSnapshots {
 		if (bindings == EmptyBindingSet.getInstance() || bindings instanceof Snapshot) {
 			return bindings;
 		}
+		return copyValues(bindings, Map.of(), Set.of());
+	}
+
+	/** Replaces present RDF values without changing which names are possible or bound. */
+	public static BindingSet mapValues(BindingSet bindings, BiFunction<String, Value, Value> mapper) {
+		Map<String, Value> replacements = null;
+		for (String name : bindings.getBindingNames()) {
+			Value value = bindings.getValue(name);
+			if (value != null) {
+				Value replacement = Objects.requireNonNull(mapper.apply(name, value));
+				if (replacement != value) {
+					if (replacements == null) {
+						replacements = new HashMap<>();
+					}
+					replacements.put(name, replacement);
+				}
+			}
+		}
+		return replacements == null ? bindings : copyValues(bindings, replacements, Set.of());
+	}
+
+	/** Copies a row while omitting private or independently handled columns. */
+	public static BindingSet without(BindingSet bindings, Set<String> excluded) {
+		return copyValues(bindings, Map.of(), excluded);
+	}
+
+	private static BindingSet copyValues(BindingSet bindings, Map<String, Value> replacements, Set<String> excluded) {
 		List<String> names = new ArrayList<>(bindings.getBindingNames());
+		if (!excluded.isEmpty()) {
+			names.removeIf(excluded::contains);
+		}
 		List<Value> values = new ArrayList<>(names.size());
 		Set<String> boundNames = null;
 		for (String name : names) {
-			values.add(bindings.getValue(name));
+			values.add(replacements.getOrDefault(name, bindings.getValue(name)));
 			// A possible name can be UNDEF, while an explicit-null binding still belongs to the source domain.
 			if (!bindings.hasBinding(name)) {
 				if (boundNames == null) {
@@ -63,7 +96,41 @@ public final class BindingSetSnapshots {
 				boundNames.remove(name);
 			}
 		}
-		return preserveMetadata(bindings, new ValueSnapshot(names, values, boundNames, bindings.size()));
+		int size = excluded.isEmpty() ? bindings.size() : boundNames == null ? names.size() : boundNames.size();
+		return preserveMetadata(bindings, new ValueSnapshot(names, values, boundNames, size));
+	}
+
+	/** Composes compatible rows. A bound name in the primary row takes precedence, including an explicit null. */
+	public static BindingSet mergeWithPrecedence(BindingSet primary, BindingSet secondary) {
+		return mergeWithPrecedence(primary, secondary, null);
+	}
+
+	/** Composes compatible rows while omitting an optional control column from the secondary row. */
+	public static BindingSet mergeWithPrecedence(BindingSet primary, BindingSet secondary, String secondaryControl) {
+		Set<String> names = new LinkedHashSet<>(primary.getBindingNames());
+		for (String name : secondary.getBindingNames()) {
+			if (!name.equals(secondaryControl)) {
+				names.add(name);
+			}
+		}
+		List<Value> values = new ArrayList<>(names.size());
+		Set<String> boundNames = null;
+		for (String name : names) {
+			if (primary.hasBinding(name)) {
+				values.add(primary.getValue(name));
+			} else if (!name.equals(secondaryControl) && secondary.hasBinding(name)) {
+				values.add(secondary.getValue(name));
+			} else {
+				values.add(null);
+				if (boundNames == null) {
+					boundNames = new LinkedHashSet<>(names);
+				}
+				boundNames.remove(name);
+			}
+		}
+		int size = boundNames == null ? names.size() : boundNames.size();
+		BindingSet snapshot = new ValueSnapshot(new ArrayList<>(names), values, boundNames, size);
+		return preserveMetadata(primary, preserveMetadata(secondary, snapshot));
 	}
 
 	/**

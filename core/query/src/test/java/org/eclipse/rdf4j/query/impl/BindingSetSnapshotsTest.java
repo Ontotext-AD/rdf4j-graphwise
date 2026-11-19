@@ -42,4 +42,38 @@ class BindingSetSnapshotsTest {
 		assertEquals(value, snapshot.getValue("bound"));
 		assertEquals(1, snapshot.size());
 	}
+
+	@Test
+	void mergePreservesCallerShadowingAndFillsOnlyOpenSlots() {
+		Value value = SimpleValueFactory.getInstance().createLiteral("value");
+		BindingSet caller = new ListBindingSet(List.of("explicitNull", "filled", "stillUndef"),
+				null, null, null) {
+			@Override
+			public boolean hasBinding(String name) {
+				return "explicitNull".equals(name);
+			}
+
+			@Override
+			public int size() {
+				return 1;
+			}
+		};
+		BindingSet result = new ListBindingSet(List.of("explicitNull", "filled", "otherUndef", "ordinal"),
+				value, value, null, value);
+
+		BindingSet merged = BindingSetSnapshots.mergeWithPrecedence(caller, result, "ordinal");
+
+		assertEquals(Set.of("explicitNull", "filled", "stillUndef", "otherUndef"), merged.getBindingNames());
+		assertTrue(merged.hasBinding("explicitNull"));
+		assertNull(merged.getValue("explicitNull"));
+		assertNull(merged.getBinding("explicitNull"));
+		assertTrue(merged.hasBinding("filled"));
+		assertEquals(value, merged.getValue("filled"));
+		assertFalse(merged.hasBinding("stillUndef"));
+		assertFalse(merged.hasBinding("otherUndef"));
+		assertEquals(2, merged.size());
+		var iter = merged.iterator();
+		assertEquals("filled", iter.next().getName());
+		assertFalse(iter.hasNext());
+	}
 }

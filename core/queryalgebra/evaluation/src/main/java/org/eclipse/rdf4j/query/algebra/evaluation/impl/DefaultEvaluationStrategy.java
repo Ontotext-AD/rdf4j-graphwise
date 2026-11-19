@@ -65,6 +65,7 @@ import org.eclipse.rdf4j.query.Dataset;
 import org.eclipse.rdf4j.query.MutableBindingSet;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
 import org.eclipse.rdf4j.query.QueryExecutionPolicy;
+import org.eclipse.rdf4j.query.algebra.AbstractQueryModelNode;
 import org.eclipse.rdf4j.query.algebra.And;
 import org.eclipse.rdf4j.query.algebra.ArbitraryLengthPath;
 import org.eclipse.rdf4j.query.algebra.BNodeGenerator;
@@ -207,6 +208,7 @@ import org.eclipse.rdf4j.query.algebra.evaluation.util.ValueComparator;
 import org.eclipse.rdf4j.query.algebra.evaluation.util.XMLDatatypeMathUtil;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractSimpleQueryModelVisitor;
 import org.eclipse.rdf4j.query.algebra.helpers.LocalBNodeReferences;
+import org.eclipse.rdf4j.query.algebra.helpers.PreparedQueryBindingPlan;
 import org.eclipse.rdf4j.query.explanation.TelemetryMetricNames;
 import org.eclipse.rdf4j.query.impl.BlankNodeAllocationScope;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
@@ -535,19 +537,38 @@ public class DefaultEvaluationStrategy implements EvaluationStrategy, FederatedS
 		knownIds.forEach(blankNodes::reserveKnownID);
 		blankNodes.reserve(dataset);
 		blankNodes.reserve(parameters);
+		boolean customRuntime = pipeline != standardPipeline
+				&& context.mode() == BindingOptimizationContext.Mode.RUNTIME;
 		TupleExpr result = withPreparedTupleExpr(expr, prepared -> {
-			QueryEvaluationUtility.pinFunctions(prepared);
-			TupleExpr optimized = prepared;
+			// A direct TupleExpr implementation has no durable owner for an incomplete SERVICE rewrite. Give the
+			// custom pipeline its own tree so an exception cannot leave the caller's extension partially rewritten.
+			TupleExpr optimized = customRuntime && !(prepared instanceof AbstractQueryModelNode)
+					? prepared.clone()
+					: prepared;
+			QueryEvaluationUtility.pinFunctions(optimized);
 			if (context.mode() == BindingOptimizationContext.Mode.EMPTY_INPUT) {
 				BindingOptimizationContext.forOptimizer(optimized, parameters);
 			}
+			// The standard binding assigner records its completed substitutions before later rewrites. A custom
+			// pipeline may rewrite immediately, so only substitutions already present on entry are proven.
+			boolean recordRuntimeInputs = customRuntime;
 			for (QueryOptimizer optimizer : pipeline.getOptimizers()) {
+				if (recordRuntimeInputs) {
+					PreparedQueryBindingPlan.recordRuntimeOptimization(optimized);
+					recordRuntimeInputs = false;
+				}
 				optimized = QueryEvaluationUtility.withFreshPreparedQuerySafetySnapshot(optimized, optimizerRoot -> {
 					BindingSet legacy = PreparedQuery.optimizerInput(optimizerRoot, parameters);
 					BindingSet selected = pipeline == standardPipeline
 							&& context.mode() != BindingOptimizationContext.Mode.SAIL_COMPATIBILITY ? legacy
 									: pipeline.getOptimizerInputBindings(optimizer, legacy, context.mode());
-					optimizer.optimize(optimizerRoot, dataset, PreparedQuery.optimizerInput(optimizerRoot, selected));
+					BindingSet input = PreparedQuery.optimizerInput(optimizerRoot, selected);
+					if (customRuntime) {
+						return PreparedQueryBindingPlan.trackRuntimeServiceRewrites(optimizerRoot,
+								context.evaluationInput(),
+								() -> optimizer.optimize(optimizerRoot, dataset, input));
+					}
+					optimizer.optimize(optimizerRoot, dataset, input);
 					return optimizerRoot;
 				});
 			}

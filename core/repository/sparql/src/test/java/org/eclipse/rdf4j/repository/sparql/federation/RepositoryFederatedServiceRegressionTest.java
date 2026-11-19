@@ -13,6 +13,7 @@ package org.eclipse.rdf4j.repository.sparql.federation;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -23,6 +24,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -74,6 +76,7 @@ import org.eclipse.rdf4j.repository.Repository;
 import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.RepositoryException;
 import org.eclipse.rdf4j.repository.sparql.query.InsertBindingSetCursor;
+import org.eclipse.rdf4j.repository.sparql.query.SPARQLQueryBindingSet;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
@@ -81,6 +84,99 @@ class RepositoryFederatedServiceRegressionTest {
 
 	private static final ValueFactory VF = SimpleValueFactory.getInstance();
 	private static final IRI PREDICATE = VF.createIRI("urn:test:p");
+
+	private enum ServiceTransport {
+		SCALAR,
+		SERIALIZED_CROSS_PRODUCT,
+		SERIALIZED_ROW_INDEX,
+		NATIVE_LOCAL_JOIN
+	}
+
+	@Test
+	void successfulServiceJoinPreservesCallerExplicitNull() {
+		assertAll(
+				() -> assertServiceJoinPreservesCallerExplicitNull(ServiceTransport.SCALAR),
+				() -> assertServiceJoinPreservesCallerExplicitNull(ServiceTransport.SERIALIZED_CROSS_PRODUCT),
+				() -> assertServiceJoinPreservesCallerExplicitNull(ServiceTransport.SERIALIZED_ROW_INDEX),
+				() -> assertServiceJoinPreservesCallerExplicitNull(ServiceTransport.NATIVE_LOCAL_JOIN));
+	}
+
+	private static void assertServiceJoinPreservesCallerExplicitNull(ServiceTransport transport) throws Exception {
+		Harness harness = new Harness(transport != ServiceTransport.NATIVE_LOCAL_JOIN);
+		IRI subject = VF.createIRI("urn:test:subject");
+		Value value = VF.createLiteral("result");
+		SPARQLQueryBindingSet input = new SPARQLQueryBindingSet();
+		input.setBinding("explicitNull", null);
+		boolean indexed = transport == ServiceTransport.SERIALIZED_ROW_INDEX;
+		if (indexed) {
+			input.setBinding("subject", subject);
+		}
+		List<BindingSet> originals = transport == ServiceTransport.SCALAR ? List.of(input) : List.of(input, input);
+		List<BindingSet> response = indexed
+				? List.of(binding("value", value, "__rowIdx", VF.createLiteral("0")),
+						binding("value", value, "__rowIdx", VF.createLiteral("1")))
+				: List.of(binding("subject", subject, "value", value));
+		TupleQueryResult remote = tupleResult(response);
+		when(harness.query.evaluate()).thenReturn(remote);
+		Service service = parsedService("?subject <urn:test:p> ?value");
+
+		List<BindingSet> actual = evaluate(harness.service, service, originals);
+
+		verify(harness.query).evaluate();
+		assertEquals(originals.size(), actual.size());
+		for (BindingSet row : actual) {
+			assertEquals(Set.of("subject", "value", "explicitNull"), row.getBindingNames(), transport.name());
+			assertEquals(3, row.size());
+			assertEquals(subject, row.getValue("subject"));
+			assertEquals(value, row.getValue("value"));
+			assertTrue(row.hasBinding("explicitNull"));
+			assertNull(row.getValue("explicitNull"));
+			assertNull(row.getBinding("explicitNull"));
+			List<String> iteratedNames = new ArrayList<>();
+			row.forEach(binding -> iteratedNames.add(binding.getName()));
+			assertEquals(2, iteratedNames.size());
+			assertEquals(Set.of("subject", "value"), Set.copyOf(iteratedNames));
+		}
+	}
+
+	@Test
+	void existingBoundJoinBatchKeepsItsBoundaryWithoutChangingProviderConfiguration() throws Exception {
+		Harness harness = new Harness();
+		RepositoryFederatedService provider = spy(harness.service);
+		provider.setBoundJoinBlockSize(1);
+		provider.setPartitionToleranceDeclared(true);
+		TupleQueryResult remote = tupleResult(List.of(binding("subject", VF.createIRI("urn:test:subject"))));
+		when(harness.query.evaluate()).thenReturn(remote);
+		Service service = parsedService("?subject <urn:test:p> ?value");
+		List<BindingSet> callers = List.of(binding("tag", VF.createLiteral(1)), binding("tag", VF.createLiteral(1)));
+
+		var results = collect(provider.evaluateBoundJoinBatch(service, new ListIteration<>(callers), null));
+
+		assertEquals(2, results.size());
+		verify(provider).evaluate(any(Service.class), any(), nullable(String.class));
+		verify(harness.query).evaluate();
+		assertEquals(1, provider.getBoundJoinBlockSize());
+		assertTrue(provider.isPartitionToleranceDeclared());
+	}
+
+	@Test
+	void directSelectPreservesExplicitNullOverSameNamedOutput() throws Exception {
+		Harness harness = new Harness();
+		IRI subject = VF.createIRI("urn:test:subject");
+		TupleQueryResult remote = tupleResult(
+				List.of(binding("subject", subject, "value", VF.createLiteral("remote"))));
+		when(harness.query.evaluate()).thenReturn(remote);
+		SPARQLQueryBindingSet caller = new SPARQLQueryBindingSet();
+		caller.setBinding("value", null);
+		Service service = parsedService("?subject <urn:test:p> ?value");
+		List<BindingSet> rows = collect(harness.service.select(service, Set.of("subject", "value"), caller, null));
+
+		assertEquals(1, rows.size());
+		BindingSet row = rows.getFirst();
+		assertEquals(subject, row.getValue("subject"));
+		assertTrue(row.hasBinding("value"));
+		assertNull(row.getValue("value"));
+	}
 
 	@Test
 	void nativeServiceSelectReceivesCapturedLogicalParameters() throws Exception {
@@ -231,8 +327,7 @@ class RepositoryFederatedServiceRegressionTest {
 			PreparedQueryBindingPlan.create(new QueryRoot(service),
 					binding("id", VF.createLiteral("bob"), "unused", VF.createLiteral("ignored")),
 					PreparedQueryBindingPlan.Mode.EMPTY_INPUT,
-					(nested, values) -> SPARQLQueries.getPreparedBindingReadNames(nested.getAskQueryString(),
-							nested.getBaseURI(), values))
+					SPARQLQueries.preparedServiceReadValidator())
 					.apply();
 			assertEquals(List.of(binding("person", VF.createIRI("urn:local"))),
 					collect(harness.service.select(service, Set.of("person"), EmptyBindingSet.getInstance(), null)));

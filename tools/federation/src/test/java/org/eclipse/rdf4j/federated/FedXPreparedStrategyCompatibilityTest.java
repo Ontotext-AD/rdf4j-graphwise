@@ -12,41 +12,71 @@
 package org.eclipse.rdf4j.federated;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.withSettings;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
+import org.eclipse.rdf4j.common.iteration.CloseableIteratorIteration;
+import org.eclipse.rdf4j.common.iteration.CooperativeCancellation;
+import org.eclipse.rdf4j.common.iteration.Iterations;
+import org.eclipse.rdf4j.federated.algebra.FedXService;
 import org.eclipse.rdf4j.federated.algebra.SingleSourceQuery;
 import org.eclipse.rdf4j.federated.endpoint.EndpointFactory;
 import org.eclipse.rdf4j.federated.evaluation.FederationEvaluationStrategy;
 import org.eclipse.rdf4j.federated.evaluation.FederationEvaluationStrategyFactory;
 import org.eclipse.rdf4j.federated.repository.FedXRepository;
 import org.eclipse.rdf4j.federated.repository.FedXRepositoryConnection;
+import org.eclipse.rdf4j.federated.structures.QueryInfo;
+import org.eclipse.rdf4j.federated.structures.QueryType;
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
 import org.eclipse.rdf4j.model.vocabulary.FOAF;
 import org.eclipse.rdf4j.model.vocabulary.OWL;
 import org.eclipse.rdf4j.model.vocabulary.RDF;
+import org.eclipse.rdf4j.model.vocabulary.XSD;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.Dataset;
 import org.eclipse.rdf4j.query.QueryResults;
+import org.eclipse.rdf4j.query.algebra.BindingSetAssignment;
 import org.eclipse.rdf4j.query.algebra.Extension;
 import org.eclipse.rdf4j.query.algebra.ExtensionElem;
 import org.eclipse.rdf4j.query.algebra.QueryRoot;
+import org.eclipse.rdf4j.query.algebra.Service;
 import org.eclipse.rdf4j.query.algebra.SingletonSet;
 import org.eclipse.rdf4j.query.algebra.StatementPattern;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.Var;
 import org.eclipse.rdf4j.query.algebra.evaluation.TripleSource;
+import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedService;
+import org.eclipse.rdf4j.query.algebra.evaluation.federation.ServiceJoinIterator;
+import org.eclipse.rdf4j.query.algebra.evaluation.impl.DefaultEvaluationStrategy;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.EvaluationStatistics;
 import org.eclipse.rdf4j.query.algebra.evaluation.optimizer.ConstantOptimizer;
+import org.eclipse.rdf4j.query.impl.BlankNodeAllocationScope;
+import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
+import org.eclipse.rdf4j.query.impl.RemoteBNode;
 import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.sail.SailRepository;
+import org.eclipse.rdf4j.repository.sparql.federation.CollectionIteration;
+import org.eclipse.rdf4j.repository.sparql.federation.RepositoryFederatedService;
 import org.eclipse.rdf4j.sail.memory.MemoryStore;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 class FedXPreparedStrategyCompatibilityTest {
 	@Test
@@ -206,6 +236,285 @@ class FedXPreparedStrategyCompatibilityTest {
 			federation.shutDown();
 			first.shutDown();
 			second.shutDown();
+		}
+	}
+
+	@Test
+	void serviceBoundJoinPreservesApiBindingForCustomProvider() {
+		var vf = SimpleValueFactory.getInstance();
+		IRI valuePredicate = vf.createIRI("urn:value");
+		IRI matchPredicate = vf.createIRI("urn:match");
+		IRI wanted = vf.createIRI("urn:wanted");
+		SailRepository remote = new SailRepository(new MemoryStore());
+		remote.init();
+		try {
+			try (var connection = remote.getConnection()) {
+				for (String name : List.of("a", "b", "c")) {
+					IRI subject = vf.createIRI("urn:" + name);
+					connection.add(subject, valuePredicate, vf.createLiteral(name));
+					connection.add(subject, matchPredicate, name.equals("c") ? vf.createIRI("urn:other") : wanted);
+				}
+			}
+			for (FedXConfig config : List.of(new FedXConfig().withEnableServiceAsBoundJoin(false), new FedXConfig())) {
+				QueryTextService provider = new ProvenancePreservingQueryTextService(remote);
+				assertThat(evaluatePreparedService(provider, wanted, config))
+						.as("SERVICE bound join enabled: %s", config.getEnableServiceAsBoundJoin())
+						.extracting(row -> row.getValue("a"), row -> row.getValue("o"))
+						.containsExactlyInAnyOrder(tuple(vf.createIRI("urn:a"), vf.createLiteral("a")),
+								tuple(vf.createIRI("urn:b"), vf.createLiteral("b")));
+				assertThat(provider.vectorRequests).hasValue(config.getEnableServiceAsBoundJoin() ? 1 : 0);
+				assertThat(provider.scalarRequests).hasValue(config.getEnableServiceAsBoundJoin() ? 0 : 3);
+			}
+		} finally {
+			remote.shutDown();
+		}
+	}
+
+	@Test
+	void serviceBoundJoinScopesLegacyBlankNodeResultsPerScalarResponse() {
+		var vf = SimpleValueFactory.getInstance();
+		IRI a = vf.createIRI("urn:a");
+		IRI b = vf.createIRI("urn:b");
+		IRI c = vf.createIRI("urn:c");
+		IRI valuePredicate = vf.createIRI("urn:value");
+		IRI matchPredicate = vf.createIRI("urn:match");
+		IRI wanted = vf.createIRI("urn:wanted");
+		var remoteNode = vf.createBNode("remote-label");
+		SailRepository remote = new SailRepository(new MemoryStore());
+		remote.init();
+		try {
+			try (var connection = remote.getConnection()) {
+				for (IRI subject : List.of(a, b, c)) {
+					connection.add(subject, valuePredicate, remoteNode);
+					connection.add(subject, matchPredicate, c.equals(subject) ? vf.createIRI("urn:other") : wanted);
+				}
+			}
+			QueryTextService provider = new QueryTextService(remote);
+			List<BindingSet> rows = evaluatePreparedService(provider, wanted,
+					new FedXConfig().withEnableServiceAsBoundJoin(true));
+			assertThat(rows).extracting(row -> row.getValue("a")).containsExactlyInAnyOrder(a, b);
+			assertThat(rows).extracting(row -> row.getValue("o"))
+					.allSatisfy(value -> assertThat(value).isInstanceOfSatisfying(RemoteBNode.class,
+							node -> assertThat(node.getProvenance().remoteID()).isEqualTo(remoteNode.getID())));
+			assertThat(rows.get(0).getValue("o")).isNotEqualTo(rows.get(1).getValue("o"));
+			assertThat(provider.vectorRequests).hasValue(0);
+			assertThat(provider.scalarRequests).hasValue(3);
+		} finally {
+			remote.shutDown();
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({ "2,2", "1,2", "2,1" })
+	void scalarFallbackPreservesFullyBoundServiceMultiplicity(int callers, int matches) {
+		var vf = SimpleValueFactory.getInstance();
+		var one = vf.createLiteral("1", XSD.INTEGER);
+		MapBindingSet row = new MapBindingSet();
+		row.addBinding("o", one);
+		List<BindingSet> batch = Collections.nCopies(callers, row);
+		var values = new BindingSetAssignment();
+		values.setBindingNames(Set.of("o"));
+		values.setBindingSets(Collections.nCopies(matches, row));
+		var service = new Service(Var.of("endpoint", vf.createIRI("urn:ep"), true, true), values,
+				"VALUES ?o { " + "1 ".repeat(matches) + "}", null, null, false);
+		var memory = new SailRepository(new MemoryStore());
+		memory.init();
+		var provider = new RepositoryFederatedService(memory, false) {
+		};
+		try {
+			TripleSource source = mock(TripleSource.class);
+			when(source.getValueFactory()).thenReturn(vf);
+			var strategy = new DefaultEvaluationStrategy(source, null, ignored -> provider);
+			var direct = Iterations
+					.asList(provider.evaluate(service, new CloseableIteratorIteration<>(batch.iterator()),
+							null));
+			var scheduled = Iterations.asList(ServiceJoinIterator.forBoundJoinBatch(batch, service, strategy,
+					new BlankNodeAllocationScope()));
+			var streaming = Iterations
+					.asList(new ServiceJoinIterator(new CloseableIteratorIteration<>(batch.iterator()),
+							service, EmptyBindingSet.getInstance(), strategy));
+			assertThat(direct).as("provider vector").hasSize(callers * matches);
+			assertThat(scheduled).as("scheduler-owned batch").containsExactlyElementsOf(direct);
+			assertThat(streaming).as("streaming fallback").containsExactlyElementsOf(direct);
+		} finally {
+			provider.shutdown();
+			memory.shutDown();
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({ "false,false", "true,false", "false,true" })
+	void serviceBoundJoinClosesProviderResponseExactlyOnce(boolean exhaustResponse, boolean requestCancellation) {
+		FederatedService provider = mock(FederatedService.class);
+		CloseableIteration<BindingSet> response = mock(withSettings().extraInterfaces(CooperativeCancellation.class));
+		CooperativeCancellation cancellation = (CooperativeCancellation) response;
+		BindingSet row = EmptyBindingSet.getInstance();
+		if (exhaustResponse) {
+			var results = List.of(row).iterator();
+			when(response.hasNext()).thenAnswer(invocation -> results.hasNext());
+			when(response.next()).thenAnswer(invocation -> results.next());
+		}
+		if (requestCancellation) {
+			when(cancellation.requestCancellation()).thenReturn(true);
+		}
+		when(provider.isInitialized()).thenReturn(true);
+		when(provider.preservesBNodeResultProvenance()).thenReturn(true);
+		when(provider.evaluateBoundJoinBatch(any(Service.class), any(), isNull())).thenReturn(response);
+		SailRepository member = new SailRepository(new MemoryStore());
+		FedXRepository federation = FedXFactory.newFederation()
+				.withMembers(List.of(EndpointFactory.loadEndpoint("member", member)))
+				.withFederatedServiceResolver(url -> provider)
+				.create();
+		try {
+			federation.init();
+			var context = federation.getFederationContext();
+			var strategy = context.createStrategy(null);
+			QueryInfo queryInfo = new QueryInfo(null, null, QueryType.SELECT, 0, false, context, strategy, null);
+			try {
+				var endpoint = Var.of("endpoint", SimpleValueFactory.getInstance().createIRI("urn:external"));
+				Service service = new Service(endpoint, new SingletonSet(), "", null, null, false);
+				try (var output = strategy.evaluateService(new FedXService(service, queryInfo), List.of(row))) {
+					if (exhaustResponse) {
+						assertThat(output.next()).isSameAs(row);
+						assertThat(output.hasNext()).isFalse();
+					}
+					if (requestCancellation) {
+						assertThat(CooperativeCancellation.forward(output)).isTrue();
+						verify(cancellation).requestCancellation();
+					}
+				}
+				verify(provider).evaluateBoundJoinBatch(any(Service.class), any(), isNull());
+				verify(response).close();
+				if (!exhaustResponse) {
+					verifyNoMoreInteractions(response);
+				}
+			} finally {
+				queryInfo.close();
+			}
+		} finally {
+			federation.shutDown();
+			member.shutDown();
+		}
+	}
+
+	private static List<BindingSet> evaluatePreparedService(FederatedService provider, IRI wanted, FedXConfig config) {
+		SailRepository first = new SailRepository(new MemoryStore());
+		SailRepository second = new SailRepository(new MemoryStore());
+		FedXRepository federation = FedXFactory.newFederation()
+				.withMembers(List.of(EndpointFactory.loadEndpoint("first", first),
+						EndpointFactory.loadEndpoint("second", second)))
+				.withFederatedServiceResolver(url -> provider)
+				.withConfig(config)
+				.create();
+		try {
+			federation.init();
+			try (var connection = federation.getConnection()) {
+				var query = connection.prepareTupleQuery("""
+						SELECT ?a ?o WHERE {
+						  VALUES ?a { <urn:a> <urn:b> <urn:c> }
+						  SERVICE <urn:external> { ?a <urn:value> ?o . ?a <urn:match> ?param }
+						}
+						""");
+				query.setBinding("param", wanted);
+				return QueryResults.asList(query.evaluate());
+			}
+		} finally {
+			federation.shutDown();
+			first.shutDown();
+			second.shutDown();
+		}
+	}
+
+	/** Implements the existing provider callbacks using only query text and the supplied runtime bindings. */
+	private static class QueryTextService implements FederatedService {
+		private final SailRepository repository;
+		private final AtomicInteger scalarRequests = new AtomicInteger();
+		private final AtomicInteger vectorRequests = new AtomicInteger();
+
+		private QueryTextService(SailRepository repository) {
+			this.repository = repository;
+		}
+
+		@Override
+		public boolean ask(Service service, BindingSet bindings, String baseUri) {
+			try (var connection = repository.getConnection()) {
+				var query = connection.prepareBooleanQuery(service.getAskQueryString());
+				bindings.forEach(binding -> query.setBinding(binding.getName(), binding.getValue()));
+				return query.evaluate();
+			}
+		}
+
+		@Override
+		public CloseableIteration<BindingSet> select(Service service, Set<String> projections, BindingSet bindings,
+				String baseUri) {
+			scalarRequests.incrementAndGet();
+			return new CollectionIteration<>(selectRows(service, projections, bindings));
+		}
+
+		@Override
+		public CloseableIteration<BindingSet> evaluate(Service service, CloseableIteration<BindingSet> bindings,
+				String baseUri) {
+			vectorRequests.incrementAndGet();
+			List<BindingSet> rows = new ArrayList<>();
+			try (bindings) {
+				while (bindings.hasNext()) {
+					BindingSet input = bindings.next();
+					rows.addAll(mapVectorResponse(input, selectRows(service, Set.of(), input)));
+				}
+			}
+			return new CollectionIteration<>(rows);
+		}
+
+		protected List<BindingSet> mapVectorResponse(BindingSet input, List<BindingSet> rows) {
+			return rows;
+		}
+
+		private List<BindingSet> selectRows(Service service, Set<String> projections, BindingSet bindings) {
+			try (var connection = repository.getConnection()) {
+				var query = connection.prepareTupleQuery(service.getSelectQueryString(projections));
+				bindings.forEach(binding -> query.setBinding(binding.getName(), binding.getValue()));
+				return QueryResults.asList(query.evaluate()).stream().map(row -> merge(bindings, row)).toList();
+			}
+		}
+
+		private static BindingSet merge(BindingSet input, BindingSet row) {
+			MapBindingSet result = new MapBindingSet();
+			input.forEach(result::addBinding);
+			row.forEach(result::setBinding);
+			return result;
+		}
+
+		@Override
+		public boolean isInitialized() {
+			return true;
+		}
+
+		@Override
+		public void initialize() {
+		}
+
+		@Override
+		public void shutdown() {
+		}
+	}
+
+	private static final class ProvenancePreservingQueryTextService extends QueryTextService {
+		private ProvenancePreservingQueryTextService(SailRepository repository) {
+			super(repository);
+		}
+
+		@Override
+		public boolean preservesBNodeResultProvenance() {
+			return true;
+		}
+
+		@Override
+		protected List<BindingSet> mapVectorResponse(BindingSet input, List<BindingSet> rows) {
+			var response = RemoteBNode.newResponseScope(BlankNodeAllocationScope.currentOrNew(),
+					SimpleValueFactory.getInstance(), null, false);
+			BindingSet original = RemoteBNode.originalBindings(input);
+			response.seedOriginalBindings(original);
+			return rows.stream().map(row -> response.map(row, original)).toList();
 		}
 	}
 }

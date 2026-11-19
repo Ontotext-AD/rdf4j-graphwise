@@ -16,11 +16,15 @@ package org.eclipse.rdf4j.query.algebra.evaluation.federation;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
+import org.eclipse.rdf4j.common.annotation.InternalUseOnly;
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
+import org.eclipse.rdf4j.common.iteration.CloseableIteratorIteration;
 import org.eclipse.rdf4j.common.iteration.ConvertingIteration;
+import org.eclipse.rdf4j.common.iteration.Iterations;
 import org.eclipse.rdf4j.http.client.QueryExecutionContext;
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
+import org.eclipse.rdf4j.query.Binding;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
 import org.eclipse.rdf4j.query.algebra.Service;
@@ -31,7 +35,10 @@ import org.eclipse.rdf4j.query.algebra.evaluation.impl.evaluationsteps.ServiceQu
 import org.eclipse.rdf4j.query.algebra.evaluation.iterator.JoinIterator;
 import org.eclipse.rdf4j.query.algebra.evaluation.util.ExternalValuePreparation;
 import org.eclipse.rdf4j.query.explanation.TelemetryMetricNames;
+import org.eclipse.rdf4j.query.impl.BindingSetSnapshots;
 import org.eclipse.rdf4j.query.impl.BlankNodeAllocationScope;
+import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
+import org.eclipse.rdf4j.query.impl.ListBindingSet;
 import org.eclipse.rdf4j.query.impl.RemoteBNode;
 import org.eclipse.rdf4j.query.parser.sparql.SPARQLQueries;
 import org.eclipse.rdf4j.repository.sparql.federation.JoinExecutorBase;
@@ -48,6 +55,7 @@ public class ServiceJoinIterator extends JoinExecutorBase<BindingSet> {
 	protected EvaluationStrategy strategy;
 	private final QueryEvaluationStep scalarRight;
 	private final BlankNodeAllocationScope allocation;
+	private final List<BindingSet> callerBatch;
 
 	/**
 	 * Construct a service join iteration to use vectored evaluation. The constructor automatically starts evaluation.
@@ -72,19 +80,46 @@ public class ServiceJoinIterator extends JoinExecutorBase<BindingSet> {
 	public ServiceJoinIterator(CloseableIteration<BindingSet> leftIter, Service service,
 			BindingSet bindings, EvaluationStrategy strategy, QueryEvaluationStep scalarRight,
 			BlankNodeAllocationScope allocation) {
-		// The executor and its scalar/provider result may both own a close path to this input. Share one idempotent
-		// owner so cancellation, normal completion and exceptional close reach the original iterator exactly once.
-		super(new ConvertingIteration<BindingSet, BindingSet>(leftIter) {
-			@Override
-			protected BindingSet convert(BindingSet row) {
-				return row;
-			}
-		}, service, bindings);
+		this(leftIter, service, bindings, strategy, scalarRight, allocation, null);
+	}
+
+	/** Evaluates a batch already formed by a bound-join scheduler. */
+	@InternalUseOnly
+	public static ServiceJoinIterator forBoundJoinBatch(List<BindingSet> batch, Service service,
+			EvaluationStrategy strategy, BlankNodeAllocationScope allocation) {
+		return new ServiceJoinIterator(new CloseableIteratorIteration<>(batch.iterator()), service,
+				EmptyBindingSet.getInstance(), strategy, input -> strategy.evaluate(service, input), allocation, batch);
+	}
+
+	private ServiceJoinIterator(CloseableIteration<BindingSet> leftIter, Service service,
+			BindingSet bindings, EvaluationStrategy strategy, QueryEvaluationStep scalarRight,
+			BlankNodeAllocationScope allocation, List<BindingSet> callerBatch) {
+		super(callerRows(leftIter, service), service, bindings);
 		this.service = service;
 		this.strategy = strategy;
 		this.scalarRight = scalarRight;
 		this.allocation = allocation;
+		this.callerBatch = callerBatch;
 		run();
+	}
+
+	private static CloseableIteration<BindingSet> callerRows(CloseableIteration<BindingSet> input, Service service) {
+		Binding endpoint = FederatedServiceIdentity.publicEndpointInput(service);
+		BindingSet endpointRow = endpoint == null ? EmptyBindingSet.getInstance()
+				: new ListBindingSet(List.of(endpoint.getName()), endpoint.getValue());
+		// The provider merges results with the original caller domain. Restore the endpoint there before transport,
+		// so GROUP and other operators consuming SERVICE rows receive it. This wrapper also owns the input close.
+		return new ConvertingIteration<>(input) {
+			@Override
+			protected BindingSet convert(BindingSet row) {
+				if (endpoint == null) {
+					return row;
+				}
+				BindingSet original = RemoteBNode.originalBindings(row);
+				return original.hasBinding(endpoint.getName()) ? row
+						: BindingSetSnapshots.mergeWithPrecedence(original, endpointRow);
+			}
+		};
 	}
 
 	@Override
@@ -95,7 +130,7 @@ public class ServiceJoinIterator extends JoinExecutorBase<BindingSet> {
 			Var serviceRef = service.getServiceRef();
 			fallbackEvaluation = !serviceRef.hasValue();
 
-			if (!serviceRef.hasValue() || service.isSilent()) {
+			if (!serviceRef.hasValue() || service.isSilent() && callerBatch == null) {
 				addScalarResults();
 				return;
 			}
@@ -117,7 +152,8 @@ public class ServiceJoinIterator extends JoinExecutorBase<BindingSet> {
 				return;
 			}
 			FederatedService fs = strategy.getService(serviceRef.getValue().stringValue());
-			if (!fs.preservesBNodeResultProvenance()) {
+			if (!fs.preservesBNodeResultProvenance()
+					|| (!fs.preservesCallerBindingDomain() && requiresCallerDomainPreservation())) {
 				addScalarResults();
 				return;
 			}
@@ -161,7 +197,9 @@ public class ServiceJoinIterator extends JoinExecutorBase<BindingSet> {
 						.initializeBindings(checkedInputs);
 				try (var active = allocation.activate();
 						QueryExecutionContext.Activation ignored = QueryExecutionContext.deferReplaySafepoints()) {
-					result = fs.evaluate(requestService, externalBindings, requestService.getBaseURI());
+					result = callerBatch == null
+							? fs.evaluate(requestService, externalBindings, requestService.getBaseURI())
+							: fs.evaluateBoundJoinBatch(requestService, externalBindings, requestService.getBaseURI());
 				}
 				if (response != null) {
 					result = new ConvertingIteration<BindingSet, BindingSet>(result) {
@@ -171,7 +209,12 @@ public class ServiceJoinIterator extends JoinExecutorBase<BindingSet> {
 						}
 					};
 				}
-				addResultAfterReplaySafepoint(result, runtimeTelemetryEnabled);
+				if (service.isSilent()) {
+					// A failed batch contributes its complete caller input, even when the provider failed during
+					// reading.
+					result = new CloseableIteratorIteration<>(Iterations.asList(result).iterator());
+				}
+				setResponseAfterReplaySafepoint(result, runtimeTelemetryEnabled);
 			} finally {
 				if (runtimeTelemetryEnabled) {
 					recordRequestLatency(service, started);
@@ -184,18 +227,43 @@ public class ServiceJoinIterator extends JoinExecutorBase<BindingSet> {
 					incrementLongMetric(service, TelemetryMetricNames.REMOTE_TIMEOUT_COUNT_ACTUAL);
 				}
 			}
+			if (callerBatch != null && service.isSilent() && e instanceof RuntimeException failure
+					&& !QueryExecutionContext.isReplaySafepointFailure(failure)) {
+				setResponseAfterReplaySafepoint(
+						callerRows(new CloseableIteratorIteration<>(callerBatch.iterator()), service),
+						false);
+				return;
+			}
 			throw e;
 		}
 	}
 
+	private boolean requiresCallerDomainPreservation() {
+		// A streaming source can produce a caller-only domain on any later row. A scheduler-owned batch
+		// is already materialized, so we can check the whole batch before making any external request.
+		if (callerBatch == null) {
+			return true;
+		}
+		for (BindingSet row : callerBatch) {
+			BindingSet caller = RemoteBNode.originalBindings(row);
+			if (caller instanceof BindingSetSnapshots.Metadata metadata && metadata.hasSnapshotMetadata()) {
+				return true;
+			}
+			for (String name : caller.getBindingNames()) {
+				if (caller.getValue(name) == null) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	private void addScalarResults() {
-		// Enqueue one lazy join, rather than one result per input, so a long input cannot fill the queue in the
-		// constructor.
 		QueryEvaluationStep request = input -> {
 			incrementLongMetric(service, TelemetryMetricNames.REMOTE_EVALUATE_REQUEST_COUNT_ACTUAL);
 			return scalarRight.evaluate(input);
 		};
-		addResultAfterReplaySafepoint(JoinIterator.getInstance(ignored -> leftIter, request, bindings), false);
+		setResponseAfterReplaySafepoint(JoinIterator.getInstance(ignored -> leftIter, request, bindings), false);
 	}
 
 	@Override
@@ -212,16 +280,16 @@ public class ServiceJoinIterator extends JoinExecutorBase<BindingSet> {
 		}
 	}
 
-	private void addResultAfterReplaySafepoint(CloseableIteration<BindingSet> result, boolean trackResponseBytes) {
+	private void setResponseAfterReplaySafepoint(CloseableIteration<BindingSet> result, boolean trackResponseBytes) {
 		CloseableIteration<BindingSet> owned = result;
 		try {
 			QueryExecutionContext.checkpointReplaySafepoint();
 			if (trackResponseBytes) {
 				owned = trackResponseBytes(service, owned);
 			}
-			owned = ExternalValuePreparation.checkReplayAfterCalls(owned);
-			addResult(owned);
-			owned = null;
+			// This executor produces one response synchronously. Transfer it straight to the slot owned by
+			// close and cancellation, including when the caller never reads from the iteration.
+			rightIter = ExternalValuePreparation.checkReplayAfterCalls(owned);
 		} catch (RuntimeException | Error failure) {
 			ExternalValuePreparation.closeWithSuppressed(owned, failure);
 			throw failure;

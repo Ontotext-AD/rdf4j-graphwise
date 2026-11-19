@@ -122,16 +122,21 @@ class MemoryStoreServicePreparedQueryBindingTest {
 				return null;
 			}).when(ask).setBinding(anyString(), any(Value.class));
 			when(tuple.evaluate()).thenAnswer(invocation -> new IteratingTupleQueryResult(List.of("person"),
-					VF.createLiteral("bob").equals(nativeInputs.getValue("id"))
-							? List.of(person("bob"))
-							: List.of(person("bob"), person("alice"))));
-			when(ask.evaluate()).thenAnswer(invocation -> nativeInputs.getValue("id") == null
-					|| VF.createLiteral("bob").equals(nativeInputs.getValue("id")));
+					matchingPeople()));
+			when(ask.evaluate()).thenAnswer(invocation -> !matchingPeople().isEmpty());
 			endpoint = new RepositoryFederatedService(repository, false);
 			MemoryStore memory = new MemoryStore();
 			memory.setFederatedServiceResolver(ignored -> endpoint);
 			sender = new SailRepository(memory);
 			sender.init();
+		}
+
+		private List<BindingSet> matchingPeople() {
+			Value id = nativeInputs.getValue("id");
+			if (id == null) {
+				return List.of(person("bob"), person("alice"));
+			}
+			return VF.createLiteral("bob").equals(id) ? List.of(person("bob")) : List.of();
 		}
 
 		@Override

@@ -18,6 +18,7 @@ import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
 import org.eclipse.rdf4j.query.algebra.Service;
+import org.eclipse.rdf4j.query.impl.RemoteBNode;
 
 /**
  * FederatedService to allow for customized evaluation of SERVICE expression. By default
@@ -59,6 +60,17 @@ public interface FederatedService {
 	 */
 	@InternalUseOnly
 	default boolean validatesRuntimeBindingTransport() {
+		return false;
+	}
+
+	/**
+	 * Whether vector results preserve the caller's complete binding domain, including explicit nulls, possible unbound
+	 * names, and binding metadata. The provider must associate each result with its caller row and merge with caller
+	 * precedence. When the engine prepares runtime transport, the caller row remains available from
+	 * {@link RemoteBNode#originalBindings(BindingSet)}.
+	 */
+	@InternalUseOnly
+	default boolean preservesCallerBindingDomain() {
 		return false;
 	}
 
@@ -124,6 +136,15 @@ public interface FederatedService {
 	CloseableIteration<BindingSet> evaluate(Service service,
 			CloseableIteration<BindingSet> bindings, String baseUri)
 			throws QueryEvaluationException;
+
+	/**
+	 * Evaluates a batch already formed by a bound-join scheduler. Providers that partition inputs honor this boundary.
+	 */
+	@InternalUseOnly
+	default CloseableIteration<BindingSet> evaluateBoundJoinBatch(Service service,
+			CloseableIteration<BindingSet> bindings, String baseUri) throws QueryEvaluationException {
+		return evaluate(service, bindings, baseUri);
+	}
 
 	/**
 	 * Method to check if {@link #initialize()} had been called.

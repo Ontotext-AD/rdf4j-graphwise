@@ -12,7 +12,13 @@
 package org.eclipse.rdf4j.query.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.util.List;
+import java.util.Set;
 
 import org.eclipse.rdf4j.model.BNode;
 import org.eclipse.rdf4j.model.IRI;
@@ -64,6 +70,44 @@ class RemoteBNodeResponseScopeTest {
 		assertSame(row, recovery.recoverOriginalBindings(row));
 		assertSame(row, recovery.recoverOriginalBindings(row, originals));
 		assertSame(plain, recovery.recoverOriginalBindings(row, originals).getValue("plain"));
+	}
+
+	@Test
+	void markingAndRecoveringCallerAliasPreserveExplicitNullAndUndef() {
+		Object epoch = new Object();
+		BNode parameter = alias(epoch);
+		BNode caller = alias(epoch);
+		RemoteBNode.ResponseScope response = scope(epoch);
+		response.seedOriginalBindings(bindings("parameter", parameter));
+		BindingSet source = new ListBindingSet(List.of("caller", "explicitNull", "undef"), caller, null, null) {
+			@Override
+			public boolean hasBinding(String name) {
+				return "explicitNull".equals(name) || super.hasBinding(name);
+			}
+
+			@Override
+			public int size() {
+				return 2;
+			}
+		};
+
+		BindingSet marked = response.markCallerAliases(source);
+		BindingSet recovered = response.recoverOriginalBindings(marked);
+
+		assertSame(caller, recovered.getValue("caller"));
+		for (BindingSet row : List.of(marked, recovered)) {
+			assertEquals(Set.of("caller", "explicitNull", "undef"), row.getBindingNames());
+			assertEquals(2, row.size());
+			assertTrue(row.hasBinding("explicitNull"));
+			assertNull(row.getValue("explicitNull"));
+			assertNull(row.getBinding("explicitNull"));
+			assertFalse(row.hasBinding("undef"));
+			assertNull(row.getValue("undef"));
+			assertNull(row.getBinding("undef"));
+			var iter = row.iterator();
+			assertEquals("caller", iter.next().getName());
+			assertFalse(iter.hasNext());
+		}
 	}
 
 	private static RemoteBNode.ResponseScope scope(Object epoch) {

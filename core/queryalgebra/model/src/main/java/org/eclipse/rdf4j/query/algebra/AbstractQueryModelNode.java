@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 
 import org.eclipse.rdf4j.common.annotation.Experimental;
+import org.eclipse.rdf4j.common.annotation.InternalUseOnly;
 import org.eclipse.rdf4j.query.algebra.helpers.QueryModelTreePrinter;
 import org.eclipse.rdf4j.query.explanation.TelemetryMetricNames;
 
@@ -44,6 +45,18 @@ public abstract class AbstractQueryModelNode implements QueryModelNode, Variable
 	private QueryModelNode parent;
 
 	private boolean isVariableScopeChange;
+	private boolean untrackedServiceRewrite;
+
+	/** A runtime optimizer rewrote a SERVICE without preserving its original request and binding provenance. */
+	@InternalUseOnly
+	public final boolean hasUntrackedServiceRewrite() {
+		return untrackedServiceRewrite;
+	}
+
+	@InternalUseOnly
+	public final void markUntrackedServiceRewrite() {
+		untrackedServiceRewrite = true;
+	}
 
 	private double resultSizeEstimate = -1;
 	private long resultSizeActual = -1;

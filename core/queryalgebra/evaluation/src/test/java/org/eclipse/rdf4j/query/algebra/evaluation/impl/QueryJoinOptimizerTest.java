@@ -86,6 +86,7 @@ import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedServiceRes
 import org.eclipse.rdf4j.query.algebra.evaluation.optimizer.ParentReferenceChecker;
 import org.eclipse.rdf4j.query.algebra.evaluation.optimizer.QueryJoinOptimizer;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractQueryModelVisitor;
+import org.eclipse.rdf4j.query.impl.BindingSetSnapshots;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
 import org.eclipse.rdf4j.query.parser.ParsedQuery;
@@ -2734,11 +2735,12 @@ public class QueryJoinOptimizerTest extends QueryOptimizerTest {
 		public CloseableIteration<BindingSet> select(Service service, Set<String> projectionVars, BindingSet bindings,
 				String baseUri) {
 			selectCalls++;
-			MapBindingSet row = new MapBindingSet();
-			for (org.eclipse.rdf4j.query.Binding binding : bindings) {
-				row.addBinding(binding);
+			BindingSet row = bindings;
+			if (!bindings.hasBinding("o")) {
+				MapBindingSet remote = new MapBindingSet(1);
+				remote.addBinding("o", VF.createIRI("urn:o1"));
+				row = BindingSetSnapshots.mergeWithPrecedence(bindings, remote);
 			}
-			row.addBinding("o", VF.createIRI("urn:o1"));
 			return new CloseableIteratorIteration<>(List.of(row).iterator());
 		}
 

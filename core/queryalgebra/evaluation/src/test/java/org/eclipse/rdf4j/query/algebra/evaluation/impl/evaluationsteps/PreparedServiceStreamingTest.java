@@ -16,17 +16,21 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.common.iteration.CloseableIteratorIteration;
 import org.eclipse.rdf4j.common.iteration.ConvertingIteration;
+import org.eclipse.rdf4j.common.iteration.Iterations;
 import org.eclipse.rdf4j.common.iteration.SingletonIteration;
 import org.eclipse.rdf4j.model.Resource;
 import org.eclipse.rdf4j.model.TripleTerm;
@@ -42,9 +46,12 @@ import org.eclipse.rdf4j.query.algebra.evaluation.federation.ServiceJoinIterator
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.DefaultEvaluationStrategy;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.EmptyTripleSource;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.EvaluationStatistics;
+import org.eclipse.rdf4j.query.algebra.evaluation.impl.GraphFrameBindings;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractQueryModelVisitor;
+import org.eclipse.rdf4j.query.impl.BindingSetSnapshots;
 import org.eclipse.rdf4j.query.impl.BlankNodeAllocationScope;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
+import org.eclipse.rdf4j.query.impl.ListBindingSet;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
 import org.eclipse.rdf4j.query.impl.RemoteBNode;
 import org.eclipse.rdf4j.query.parser.QueryParserUtil;
@@ -53,14 +60,118 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class PreparedServiceStreamingTest {
+	@ParameterizedTest
+	@ValueSource(booleans = { false, true })
+	void serviceBatchPreservesCallerOnlyBindingDomains(boolean scheduledBatch) {
+		assertServiceBatchPreservesCallerOnlyBindingDomains(scheduledBatch, false);
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = { false, true })
+	void domainPreservingProviderCanEvaluateCallerOnlyDomainsInOneBatch(boolean scheduledBatch) {
+		assertServiceBatchPreservesCallerOnlyBindingDomains(scheduledBatch, true);
+	}
+
+	private static void assertServiceBatchPreservesCallerOnlyBindingDomains(boolean scheduledBatch,
+			boolean preservesCallerDomain) {
+		var vf = SimpleValueFactory.getInstance();
+		var graph = vf.createIRI("urn:graph");
+		List<BindingSet> callers = new ArrayList<>();
+		for (int id : List.of(1, 2)) {
+			BindingSet domain = new ListBindingSet(List.of("id", "o", "undef", "graph"), vf.createLiteral(id),
+					null, null, graph) {
+				@Override
+				public boolean hasBinding(String name) {
+					return "o".equals(name) || super.hasBinding(name);
+				}
+
+				@Override
+				public int size() {
+					return 3;
+				}
+			};
+			callers.add(
+					BindingSetSnapshots.preserveMetadata(GraphFrameBindings.supply(new MapBindingSet(), "graph", graph),
+							domain));
+		}
+		FederatedService provider = mock(FederatedService.class);
+		when(provider.preservesBNodeResultProvenance()).thenReturn(true);
+		if (preservesCallerDomain) {
+			when(provider.preservesCallerBindingDomain()).thenReturn(true);
+		}
+		when(provider.select(any(), any(), any(), nullable(String.class))).thenAnswer(invocation -> {
+			assertThat(invocation.<Set<String>>getArgument(1)).containsExactly("o");
+			return literalResults(List.of(invocation.<BindingSet>getArgument(2)), false);
+		});
+		when(provider.evaluate(any(), any(), nullable(String.class))).thenAnswer(invocation -> {
+			CloseableIteration<BindingSet> inputs = invocation.getArgument(1);
+			return literalResults(Iterations.asList(inputs), preservesCallerDomain);
+		});
+		when(provider.evaluateBoundJoinBatch(any(), any(), nullable(String.class))).thenCallRealMethod();
+		Service service = service(QueryParserUtil.parseTupleQuery(QueryLanguage.SPARQL,
+				"SELECT * WHERE { SERVICE <urn:endpoint> { VALUES ?o { 1 2 } } }", null).getTupleExpr());
+		var strategy = new DefaultEvaluationStrategy(new EmptyTripleSource(), null, ignored -> provider);
+		List<BindingSet> scalar = new ArrayList<>();
+		for (BindingSet caller : callers) {
+			scalar.addAll(Iterations.asList(strategy.evaluate(service, caller)));
+		}
+		var output = scheduledBatch
+				? ServiceJoinIterator.forBoundJoinBatch(callers, service, strategy, new BlankNodeAllocationScope())
+				: new ServiceJoinIterator(new CloseableIteratorIteration<>(callers.iterator()), service,
+						EmptyBindingSet.getInstance(), strategy);
+		List<BindingSet> joined = Iterations.asList(output);
+
+		assertThat(scalar).hasSize(4);
+		assertThat(joined).hasSize(4);
+		for (List<BindingSet> rows : List.of(scalar, joined)) {
+			assertThat(rows).extracting(row -> row.getValue("id"))
+					.containsExactly(vf.createLiteral(1), vf.createLiteral(1), vf.createLiteral(2),
+							vf.createLiteral(2));
+			assertThat(rows).allSatisfy(row -> {
+				assertThat(row.getValue("o")).isNull();
+				assertThat(row.hasBinding("o")).isTrue();
+				assertThat(row.getBindingNames()).contains("undef");
+				assertThat(row.hasBinding("undef")).isFalse();
+				assertThat(row.size()).isEqualTo(3);
+				assertThat(GraphFrameBindings.isSupplied(row, "graph")).isTrue();
+			});
+		}
+		if (preservesCallerDomain) {
+			verify(provider, times(2)).select(any(), any(), any(), nullable(String.class));
+			verify(provider).evaluate(any(), any(), nullable(String.class));
+		} else {
+			verify(provider, times(4)).select(any(), any(), any(), nullable(String.class));
+			verify(provider, never()).evaluate(any(), any(), nullable(String.class));
+		}
+	}
+
+	private static CloseableIteration<BindingSet> literalResults(List<BindingSet> inputs,
+			boolean preservesCallerDomain) {
+		var vf = SimpleValueFactory.getInstance();
+		List<BindingSet> rows = new ArrayList<>();
+		for (BindingSet input : inputs) {
+			assertThat(input.getBindingNames()).containsExactlyInAnyOrder("id", "graph");
+			for (int value : List.of(1, 2)) {
+				MapBindingSet row = new MapBindingSet();
+				input.forEach(row::addBinding);
+				row.addBinding("o", vf.createLiteral(value));
+				rows.add(preservesCallerDomain
+						? BindingSetSnapshots.mergeWithPrecedence(RemoteBNode.originalBindings(input), row)
+						: row);
+			}
+		}
+		return new CloseableIteratorIteration<>(rows.iterator());
+	}
+
 	@Test
 	void customProviderCanReturnItsFirstResultAfterABoundedInputPrefix() {
 		var vf = SimpleValueFactory.getInstance();
 		FederatedService provider = mock(FederatedService.class);
 		when(provider.preservesBNodeResultProvenance()).thenReturn(true);
+		when(provider.preservesCallerBindingDomain()).thenReturn(true);
 		when(provider.evaluate(any(), any(), nullable(String.class))).thenAnswer(invocation -> {
 			CloseableIteration<BindingSet> inputs = invocation.getArgument(1);
-			return new SingletonIteration<>(inputs.next());
+			return new SingletonIteration<>(RemoteBNode.originalBindings(inputs.next()));
 		});
 		AtomicInteger consumed = new AtomicInteger();
 		CloseableIteration<BindingSet> input = source(consumed);
@@ -75,6 +186,7 @@ class PreparedServiceStreamingTest {
 	void providerFailureIsReportedWithoutDrainingInputAndCloseStillPropagates() {
 		FederatedService provider = mock(FederatedService.class);
 		when(provider.preservesBNodeResultProvenance()).thenReturn(true);
+		when(provider.preservesCallerBindingDomain()).thenReturn(true);
 		when(provider.evaluate(any(), any(), nullable(String.class)))
 				.thenThrow(new QueryEvaluationException("provider failed"));
 		AtomicInteger consumed = new AtomicInteger();
@@ -122,8 +234,16 @@ class PreparedServiceStreamingTest {
 		second.addBinding("keep", secondNode);
 		FederatedService provider = mock(FederatedService.class);
 		when(provider.preservesBNodeResultProvenance()).thenReturn(true);
-		when(provider.evaluate(any(), any(), nullable(String.class)))
-				.thenAnswer(invocation -> invocation.getArgument(1));
+		when(provider.preservesCallerBindingDomain()).thenReturn(true);
+		when(provider.evaluate(any(), any(), nullable(String.class))).thenAnswer(invocation -> {
+			CloseableIteration<BindingSet> inputs = invocation.getArgument(1);
+			return new ConvertingIteration<BindingSet, BindingSet>(inputs) {
+				@Override
+				protected BindingSet convert(BindingSet input) {
+					return RemoteBNode.originalBindings(input);
+				}
+			};
+		});
 		try (var result = join(provider,
 				new CloseableIteratorIteration<>(List.<BindingSet>of(first, second).iterator()))) {
 			assertThat(result.next().getValue("keep")).isSameAs(firstNode);
@@ -168,6 +288,7 @@ class PreparedServiceStreamingTest {
 		}
 		FederatedService provider = mock(FederatedService.class);
 		when(provider.preservesBNodeResultProvenance()).thenReturn(true);
+		when(provider.preservesCallerBindingDomain()).thenReturn(true);
 		when(provider.getBNodeIdentityScope()).thenReturn(endpointScope);
 		when(provider.supportsBlankNodeReferences()).thenReturn(true);
 		when(provider.supportsCanonicalBNodeIDs()).thenReturn(true);
@@ -177,15 +298,16 @@ class PreparedServiceStreamingTest {
 				@Override
 				protected BindingSet convert(BindingSet input) {
 					MapBindingSet row = new MapBindingSet();
-					BindingSet bindings = hasTranslatedCallerAlias ? RemoteBNode.originalBindings(input) : input;
-					bindings.forEach(row::addBinding);
-					if (row.hasBinding("maybe")) {
+					BindingSet caller = RemoteBNode.originalBindings(input);
+					Value alias = caller.getValue("maybe");
+					if (alias != null) {
 						assertThat(input.getValue("maybe")).isNotInstanceOf(RemoteBNode.class);
 						assertThat(input.getValue("maybe")).isEqualTo(vf.createBNode("same-label"));
-						Value alias = row.getValue("maybe");
 						Value copied = RemoteBNode.preserveProvenance(alias, vf.createBNode(alias.stringValue()));
 						try (var spill = new RemoteBNode.SpillScope()) {
-							row.setBinding("maybe", (Value) spill.resolve(spill.replace(copied)));
+							Value recovered = (Value) spill.resolve(spill.replace(copied));
+							caller = BindingSetSnapshots.mapValues(caller,
+									(name, value) -> name.equals("maybe") ? recovered : value);
 						}
 					} else {
 						// The endpoint returns the same alias object in a column owned by the first input only.
@@ -194,7 +316,7 @@ class PreparedServiceStreamingTest {
 					row.addBinding("copy", returnedParameter);
 					row.addBinding("remote", endpointOnly);
 					row.addBinding("endpointTerm", endpointTerm);
-					return row;
+					return BindingSetSnapshots.mergeWithPrecedence(caller, row);
 				}
 			};
 		});
@@ -270,6 +392,10 @@ class PreparedServiceStreamingTest {
 				null)
 				.getTupleExpr();
 		expression = strategy.optimizeForEmptyInput(expression, new EvaluationStatistics(), parameters);
+		return new ServiceJoinIterator(input, service(expression), EmptyBindingSet.getInstance(), strategy);
+	}
+
+	private static Service service(TupleExpr expression) {
 		AtomicReference<Service> service = new AtomicReference<>();
 		expression.visit(new AbstractQueryModelVisitor<RuntimeException>() {
 			@Override
@@ -277,6 +403,6 @@ class PreparedServiceStreamingTest {
 				service.set(node);
 			}
 		});
-		return new ServiceJoinIterator(input, service.get(), EmptyBindingSet.getInstance(), strategy);
+		return service.get();
 	}
 }

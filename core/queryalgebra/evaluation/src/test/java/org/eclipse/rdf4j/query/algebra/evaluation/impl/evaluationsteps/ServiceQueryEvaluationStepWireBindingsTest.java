@@ -25,11 +25,13 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.common.iteration.CloseableIteratorIteration;
+import org.eclipse.rdf4j.common.iteration.Iterations;
 import org.eclipse.rdf4j.http.client.SPARQLProtocolSession;
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.Resource;
@@ -40,10 +42,12 @@ import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
 import org.eclipse.rdf4j.query.Binding;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.QueryLanguage;
+import org.eclipse.rdf4j.query.algebra.BindingSetAssignment;
 import org.eclipse.rdf4j.query.algebra.Filter;
 import org.eclipse.rdf4j.query.algebra.Service;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.Var;
+import org.eclipse.rdf4j.query.algebra.evaluation.QueryBindingSet;
 import org.eclipse.rdf4j.query.algebra.evaluation.TripleSource;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.DefaultEvaluationStrategy;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.EvaluationStatistics;
@@ -257,6 +261,40 @@ class ServiceQueryEvaluationStepWireBindingsTest {
 		String body = "{ BIND(<urn:a> AS ?x) ?x <urn:p> ?o } UNION "
 				+ "{ BIND(<urn:a> AS ?x) ?x <urn:p> ?o }";
 		assertWireMatchesSource(body, EmptyBindingSet.getInstance(), Set.of(FIRST));
+	}
+
+	@Test
+	void explicitNullOnlyOutputPreservesScalarAndVectorMultiplicity() throws Exception {
+		BindingSetAssignment values = new BindingSetAssignment();
+		values.setBindingNames(Set.of("o"));
+		values.setBindingSets(List.of(row("o", VF.createLiteral(1)), row("o", VF.createLiteral(2))));
+		Service service = Service.fromBody(Var.of("endpoint", VF.createIRI("urn:endpoint"), false, true), values,
+				"VALUES ?o { 1 2 }", Map.of(), null, false);
+		QueryBindingSet caller = new QueryBindingSet();
+		caller.setBinding("o", null);
+		SPARQLProtocolSession client = mock(SPARQLProtocolSession.class);
+		when(client.sendBooleanQuery(eq(QueryLanguage.SPARQL), anyString(), isNull(), isNull(), anyBoolean(), anyInt(),
+				any(Binding[].class))).thenReturn(true);
+		when(client.sendTupleQuery(eq(QueryLanguage.SPARQL), anyString(), isNull(), isNull(), anyBoolean(), anyInt(),
+				ArgumentMatchers.<WeakReference<?>>isNull(), any(Binding[].class))).thenAnswer(
+						invocation -> new IteratingTupleQueryResult(List.of("o"), evaluate(invocation.getArgument(1))));
+		SPARQLRepository repository = new SPARQLRepository("http://example.invalid/sparql") {
+			@Override
+			protected SPARQLProtocolSession createSPARQLProtocolSession() {
+				return client;
+			}
+		};
+		RepositoryFederatedService endpoint = new RepositoryFederatedService(repository);
+		try {
+			List<BindingSet> vector = Iterations.asList(endpoint.evaluate(service,
+					new CloseableIteratorIteration<BindingSet>(List.of(caller, caller).iterator()), null));
+			assertThat(vector).containsExactly(caller, caller, caller, caller);
+			var step = new ServiceQueryEvaluationStep(service, service.getServiceRef(), ignored -> endpoint);
+			assertThat(Iterations.asList(step.evaluate(caller))).as("scalar SERVICE result bag")
+					.containsExactly(caller, caller);
+		} finally {
+			endpoint.shutdown();
+		}
 	}
 
 	private static String valuesUnion() {

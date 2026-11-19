@@ -97,6 +97,7 @@ import org.eclipse.rdf4j.query.algebra.evaluation.impl.EvaluationStatistics;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.GraphFrameBindings;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.QueryEvaluationContext;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractSimpleQueryModelVisitor;
+import org.eclipse.rdf4j.query.impl.BindingSetSnapshots;
 import org.eclipse.rdf4j.query.impl.BlankNodeAllocationScope;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
@@ -438,6 +439,27 @@ class PreparedQueryOptimizerBindingsTest {
 								.isFalse();
 					}
 				}
+			}
+		}
+	}
+
+	@Test
+	void optionalConditionRecoversProjectedParameterForBareAndCompoundReads() {
+		var vf = SimpleValueFactory.getInstance();
+		var input = new MapBindingSet();
+		input.addBinding("x", vf.createLiteral(true));
+		var expected = new MapBindingSet();
+		expected.addBinding("x", vf.createLiteral(true));
+		expected.addBinding("left", vf.createLiteral("left"));
+		expected.addBinding("right", vf.createLiteral("right"));
+		var strategy = new DefaultEvaluationStrategy(new EmptyTripleSource(), null);
+		for (String condition : List.of("?x && true", "?x")) {
+			String query = "SELECT ?x ?left ?right WHERE { VALUES ?left { \"left\" }"
+					+ " OPTIONAL { VALUES ?right { \"right\" } FILTER(" + condition + ") } }";
+			TupleExpr expression = QueryParserUtil.parseTupleQuery(QueryLanguage.SPARQL, query, null).getTupleExpr();
+			TupleExpr prepared = strategy.optimizeForEmptyInput(expression, new EvaluationStatistics(), input);
+			try (var rows = strategy.precompile(prepared).evaluate(EmptyBindingSet.getInstance())) {
+				assertThat(QueryResults.asList(rows)).as("OPTIONAL FILTER(%s)", condition).containsExactly(expected);
 			}
 		}
 	}
@@ -886,6 +908,7 @@ class PreparedQueryOptimizerBindingsTest {
 		var original = new ArrayList<BindingSet>();
 		var requests = new ArrayList<Service>();
 		when(remote.preservesBNodeResultProvenance()).thenReturn(true);
+		when(remote.preservesCallerBindingDomain()).thenReturn(true);
 		when(remote.evaluate(any(), any(), nullable(String.class))).thenAnswer(invocation -> {
 			Service request = invocation.getArgument(0);
 			requests.add(request);
@@ -897,9 +920,10 @@ class PreparedQueryOptimizerBindingsTest {
 					sent.add(new QueryBindingSet(bindings));
 					original.add(new QueryBindingSet(RemoteBNode.originalBindings(bindings)));
 					if (savedServiceFilterMatches(request, bindings)) {
-						var row = new QueryBindingSet(RemoteBNode.originalBindings(bindings));
+						var row = new QueryBindingSet();
 						row.setBinding("o", vf.createLiteral("matched"));
-						output.add(row);
+						output.add(
+								BindingSetSnapshots.mergeWithPrecedence(RemoteBNode.originalBindings(bindings), row));
 					}
 				}
 			}
@@ -1371,15 +1395,18 @@ class PreparedQueryOptimizerBindingsTest {
 	}
 
 	@Test
-	void serviceAskDoesNotPromoteAnApiConstraintIntoTheResult() {
+	void fullyBoundServiceSelectDoesNotPromoteAnApiConstraintIntoTheResult() {
 		var vf = SimpleValueFactory.getInstance();
 		var remote = mock(FederatedService.class);
 		var sent = new AtomicReference<BindingSet>();
 		var request = new AtomicReference<Service>();
-		when(remote.ask(any(), any(), nullable(String.class))).thenAnswer(invocation -> {
-			sent.set(invocation.getArgument(1));
+		when(remote.select(any(), any(), any(), nullable(String.class))).thenAnswer(invocation -> {
+			assertThat(invocation.<Set<String>>getArgument(1)).isEmpty();
+			sent.set(invocation.getArgument(2));
 			request.set(invocation.getArgument(0));
-			return savedServiceFilterMatches(request.get(), sent.get());
+			return savedServiceFilterMatches(request.get(), sent.get())
+					? new SingletonIteration<>(EmptyBindingSet.getInstance())
+					: new EmptyIteration<>();
 		});
 		String query = "SELECT ?x WHERE { SERVICE <urn:endpoint> { FILTER(?x = 1) } }";
 		TupleExpr expression = QueryParserUtil.parseTupleQuery(QueryLanguage.SPARQL, query, null).getTupleExpr();

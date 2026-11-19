@@ -149,7 +149,6 @@ import org.eclipse.rdf4j.query.algebra.evaluation.QueryEvaluationStep;
 import org.eclipse.rdf4j.query.algebra.evaluation.QueryOptimizer;
 import org.eclipse.rdf4j.query.algebra.evaluation.QueryValueEvaluationStep;
 import org.eclipse.rdf4j.query.algebra.evaluation.ValueExprEvaluationException;
-import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedService;
 import org.eclipse.rdf4j.query.algebra.evaluation.federation.ServiceJoinIterator;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.ActiveGraphQueryEvaluationContext;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.DefaultEvaluationStrategy;
@@ -181,7 +180,6 @@ import org.eclipse.rdf4j.repository.RepositoryException;
 import org.eclipse.rdf4j.repository.base.RepositoryConnectionWrapper;
 import org.eclipse.rdf4j.repository.sparql.SPARQLConnection;
 import org.eclipse.rdf4j.repository.sparql.federation.CollectionIteration;
-import org.eclipse.rdf4j.repository.sparql.federation.RepositoryFederatedService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -2210,24 +2208,11 @@ public class FederationEvaluationStrategy extends StrictEvaluationStrategy {
 	 */
 	public CloseableIteration<BindingSet> evaluateService(FedXService service,
 			final List<BindingSet> bindings) throws QueryEvaluationException {
-
-		Var serviceRef = service.getService().getServiceRef();
-		String serviceUri;
-		if (serviceRef.hasValue()) {
-			serviceUri = serviceRef.getValue().stringValue();
-		} else {
-			return new ServiceJoinIterator(new CollectionIteration<>(bindings),
-					service.getService(), EmptyBindingSet.getInstance(), this);
+		if (bindings.isEmpty()) {
+			return new EmptyIteration<>();
 		}
-
-		// use vectored evaluation
-		FederatedService fs = getService(serviceUri);
-		if (fs instanceof RepositoryFederatedService) {
-			// set the bound join block size to 0 => leave block size up to FedX engine
-			((RepositoryFederatedService) fs).setBoundJoinBlockSize(0);
-		}
-		return fs.evaluate(service.getService(), new CollectionIteration<>(bindings),
-				service.getService().getBaseURI());
+		return ServiceJoinIterator.forBoundJoinBatch(bindings, service.getService(), this,
+				service.getQueryInfo().getBlankNodeAllocationScope());
 	}
 
 	@Deprecated(forRemoval = true)

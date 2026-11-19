@@ -24,11 +24,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import org.eclipse.rdf4j.common.annotation.Experimental;
+import org.eclipse.rdf4j.common.annotation.InternalUseOnly;
 import org.eclipse.rdf4j.common.iteration.AbstractCloseableIteration;
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.common.iteration.CloseableIteratorIteration;
 import org.eclipse.rdf4j.common.iteration.ConvertingIteration;
 import org.eclipse.rdf4j.common.iteration.EmptyIteration;
+import org.eclipse.rdf4j.common.iteration.IterationWrapper;
 import org.eclipse.rdf4j.common.iteration.Iterations;
 import org.eclipse.rdf4j.common.iteration.LookAheadIteration;
 import org.eclipse.rdf4j.common.iteration.SingletonIteration;
@@ -43,6 +45,7 @@ import org.eclipse.rdf4j.query.BooleanQuery;
 import org.eclipse.rdf4j.query.MalformedQueryException;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
 import org.eclipse.rdf4j.query.QueryLanguage;
+import org.eclipse.rdf4j.query.QueryResults;
 import org.eclipse.rdf4j.query.TupleQuery;
 import org.eclipse.rdf4j.query.algebra.BindingSetAssignment;
 import org.eclipse.rdf4j.query.algebra.Exists;
@@ -68,7 +71,6 @@ import org.eclipse.rdf4j.query.impl.BindingSetSnapshots;
 import org.eclipse.rdf4j.query.impl.BlankNodeAllocationScope;
 import org.eclipse.rdf4j.query.impl.BlankNodeReferences;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
-import org.eclipse.rdf4j.query.impl.ListBindingSet;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
 import org.eclipse.rdf4j.query.impl.RemoteBNode;
 import org.eclipse.rdf4j.query.parser.QueryParserUtil;
@@ -79,7 +81,6 @@ import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.RepositoryException;
 import org.eclipse.rdf4j.repository.sparql.query.InsertBindingSetCursor;
 import org.eclipse.rdf4j.repository.sparql.query.QueryStringUtil;
-import org.eclipse.rdf4j.repository.sparql.query.SPARQLQueryBindingSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -332,7 +333,7 @@ public class RepositoryFederatedService implements FederatedService {
 	private CloseableIteration<BindingSet> select(Service service, Set<String> projectionVars,
 			BindingSet bindings, String baseUri, RepositoryConnection suppliedConnection)
 			throws QueryEvaluationException {
-		BindingSet original = RemoteBNode.originalBindings(bindings);
+		BindingSet original = BindingSetSnapshots.copyOf(RemoteBNode.originalBindings(bindings));
 		BlankNodeAllocationScope allocation = BlankNodeAllocationScope.currentOrNew();
 		allocation.reserve(original);
 		RepositoryConnection conn = suppliedConnection;
@@ -464,6 +465,15 @@ public class RepositoryFederatedService implements FederatedService {
 	public boolean validatesRuntimeBindingTransport() {
 		// These implementations use the transport checks below. Existing subclasses can override the
 		// evaluation hooks and keep receiving validated inputs unless they opt into taking responsibility.
+		return usesBuiltInVectorEvaluation();
+	}
+
+	@Override
+	public boolean preservesCallerBindingDomain() {
+		return usesBuiltInVectorEvaluation();
+	}
+
+	private boolean usesBuiltInVectorEvaluation() {
 		Class<?> implementation = getClass();
 		return implementation == RepositoryFederatedService.class || implementation == SPARQLFederatedService.class;
 	}
@@ -541,10 +551,24 @@ public class RepositoryFederatedService implements FederatedService {
 		// Invocation can produce. Partitioned (batched) evaluation is therefore only used when the endpoint
 		// has been explicitly declared partition-tolerant; otherwise the input is either pushed down in one
 		// single request (when small enough) or the service pattern is evaluated once and joined locally.
-		if (partitionToleranceDeclared && boundJoinBlockSize > 0) {
+		if (!(bindings instanceof BoundJoinBatch) && partitionToleranceDeclared && boundJoinBlockSize > 0) {
 			return new BatchingServiceIteration(bindings, boundJoinBlockSize, service);
 		}
 		return evaluateInternal(service, bindings, service.getBaseURI());
+	}
+
+	/** Sends an existing caller-owned batch through the normal provider hook without partitioning it again. */
+	@Override
+	@InternalUseOnly
+	public CloseableIteration<BindingSet> evaluateBoundJoinBatch(Service service,
+			CloseableIteration<BindingSet> bindings, String baseUri) {
+		return evaluate(service, new BoundJoinBatch(bindings), baseUri);
+	}
+
+	private static final class BoundJoinBatch extends IterationWrapper<BindingSet> {
+		private BoundJoinBatch(CloseableIteration<BindingSet> bindings) {
+			super(bindings);
+		}
 	}
 
 	/**
@@ -572,7 +596,7 @@ public class RepositoryFederatedService implements FederatedService {
 		BindingSet parameterIdentities = EmptyBindingSet.getInstance();
 		boolean valuesTransportAttempted = false;
 		try (var active = allocation.activate()) {
-			boolean fixedEndpoint = service.getServiceRef().hasValue() && !service.getServiceRef().hasApiInputOrigin();
+			boolean fixedEndpoint = service.hasFixedEndpoint();
 			Service logical = withResolvedSelector(service, originals);
 			SPARQLQueries.ServiceRequest request = SPARQLQueries.prepareServiceRequest(logical, List.of(),
 					bnodeIdentityScope, blankNodeReferencesSupported, canonicalBNodeIDsSupported);
@@ -601,7 +625,8 @@ public class RepositoryFederatedService implements FederatedService {
 			}
 			// Preserve one logical invocation and subquery input scope, after validating every outgoing identity.
 			int singleRequestLimit = boundJoinBlockSize > 0 ? boundJoinBlockSize : Integer.MAX_VALUE;
-			boolean localJoin = !partitionToleranceDeclared && originals.size() > singleRequestLimit
+			boolean localJoin = !(bindings instanceof BoundJoinBatch) && !partitionToleranceDeclared
+					&& originals.size() > singleRequestLimit
 					|| TupleExprs.containsSubquery(service.getArg());
 			boolean scalar = !localJoin && originals.size() == 1;
 			ServiceBindingScopes scopes = localJoin || scalar
@@ -844,17 +869,7 @@ public class RepositoryFederatedService implements FederatedService {
 		if (omitted.isEmpty()) {
 			return new TransportInput(original, Set.of(), false);
 		}
-		List<String> names = new ArrayList<>();
-		List<Value> values = new ArrayList<>();
-		for (String name : original.getBindingNames()) {
-			if (!omitted.contains(name)) {
-				names.add(name);
-				values.add(original.getValue(name));
-			}
-		}
-		BindingSet snapshot = BindingSetSnapshots.copyOf(new ListBindingSet(names, values));
-		return new TransportInput(BindingSetSnapshots.preserveMetadata(original, snapshot), Set.copyOf(omitted),
-				conflict);
+		return new TransportInput(BindingSetSnapshots.without(original, omitted), Set.copyOf(omitted), conflict);
 	}
 
 	private static boolean sameFixedValue(Value first, Value second) {
@@ -1073,29 +1088,14 @@ public class RepositoryFederatedService implements FederatedService {
 				}
 				while (inputIterator.hasNext()) {
 					BindingSet input = inputIterator.next();
-					BindingSet merged = merge(input, response.map(currentRemote, input));
-					if (merged != null) {
-						return merged;
+					BindingSet result = response.map(currentRemote, input);
+					if (QueryResults.bindingSetsCompatible(input, result)) {
+						return BindingSetSnapshots.mergeWithPrecedence(input, result);
 					}
 				}
 				currentRemote = null;
 				inputIterator = null;
 			}
-		}
-
-		private static BindingSet merge(BindingSet input, BindingSet remoteSolution) {
-			SPARQLQueryBindingSet merged = new SPARQLQueryBindingSet(input.size() + remoteSolution.size());
-			merged.addAll(input);
-			for (Binding binding : remoteSolution) {
-				Value existing = merged.getValue(binding.getName());
-				if (existing == null) {
-					merged.addBinding(binding);
-				} else if (!existing.equals(binding.getValue())) {
-					return null;
-				}
-			}
-			return BindingSetSnapshots.preserveMetadata(input,
-					BindingSetSnapshots.preserveMetadata(remoteSolution, merged));
 		}
 
 		@Override

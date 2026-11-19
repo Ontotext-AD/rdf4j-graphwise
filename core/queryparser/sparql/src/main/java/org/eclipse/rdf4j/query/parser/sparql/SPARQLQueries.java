@@ -267,7 +267,8 @@ public class SPARQLQueries {
 	 */
 	@InternalUseOnly
 	public static Set<String> getPreparedBindingReadNames(String source, String baseURI, BindingSet parameters) {
-		return new PreparedServiceReadValidator().readNames(source, baseURI, parameters);
+		return parameters.isEmpty() ? Set.of()
+				: new PreparedServiceReadValidator().facts(source, baseURI, parameters).reads();
 	}
 
 	/** Creates an isolated saved-text validator for one preparation of a query or request. */
@@ -277,18 +278,45 @@ public class SPARQLQueries {
 	}
 
 	private static final class PreparedServiceReadValidator implements ServiceReadValidator {
-		private Map<SavedReadContext, Set<String>> validated;
+		private final Map<SavedReadContext, SavedServiceFacts> validated = new HashMap<>();
 
 		@Override
 		public Set<String> possibleReads(Service service, BindingSet parameters) {
 			return parameters.isEmpty() ? Set.of()
-					: readNames(service.getAskQueryString(), service.getBaseURI(), parameters);
+					: facts(service.getAskQueryString(), service.getBaseURI(), parameters).reads();
 		}
 
-		private Set<String> readNames(String source, String baseURI, BindingSet parameters) {
-			if (parameters.isEmpty()) {
-				return Set.of();
+		@Override
+		public boolean preservesOutputBindings(Service service, BindingSet parameters) {
+			String source = service.getAskQueryString();
+			var saved = facts(source, service.getBaseURI(), parameters).outputs();
+			// Preview the same logical substitutions without modifying the caller's tree during preflight.
+			TupleExpr body = service.getServiceExpr().clone();
+			PreparedQueryBindingPlan.create(body, parameters, PreparedQueryBindingPlan.Mode.QUERY_PARAMETERS, this)
+					.apply();
+			var current = serviceOutputFacts(body);
+			if (!saved.possibleOutputsKnown() || !current.possibleOutputsKnown()
+					|| !saved.guaranteedOutputsKnown() || !current.guaranteedOutputsKnown()
+					|| saved.canProduceRows() != current.canProduceRows()) {
+				return false;
 			}
+			Set<String> different = new HashSet<>();
+			addDifferentNames(different, saved.possibleOutputs(), current.possibleOutputs());
+			addDifferentNames(different, saved.guaranteedOutputs(), current.guaranteedOutputs());
+			if (different.isEmpty()) {
+				return true;
+			}
+			// Anonymous parser-generated names are local to a parse. Only lexical request columns go over the wire.
+			return service.getSavedExistsBindingNames() == null ? getLexicalBindingNames(source, different).isEmpty()
+					: Collections.disjoint(service.getSavedBindingNames(), different);
+		}
+
+		private static void addDifferentNames(Set<String> result, Set<String> first, Set<String> second) {
+			first.stream().filter(name -> !second.contains(name)).forEach(result::add);
+			second.stream().filter(name -> !first.contains(name)).forEach(result::add);
+		}
+
+		private SavedServiceFacts facts(String source, String baseURI, BindingSet parameters) {
 			Map<String, Object> values = new HashMap<>();
 			for (var binding : parameters) {
 				Value value = binding.getValue();
@@ -298,12 +326,9 @@ public class SPARQLQueries {
 			}
 			// The saved text contains the actual prefix declarations, including updates made after parsing.
 			SavedReadContext context = new SavedReadContext(source, baseURI, Map.copyOf(values));
-			if (validated == null) {
-				validated = new HashMap<>();
-			}
-			Set<String> reads = validated.get(context);
-			if (reads != null) {
-				return reads;
+			SavedServiceFacts cached = validated.get(context);
+			if (cached != null) {
+				return cached;
 			}
 			TupleExpr parsed = new SPARQLParser().parseQuery(source, baseURI).getTupleExpr();
 			PreparedQueryBindingPlan plan = PreparedQueryBindingPlan.create(parsed, parameters,
@@ -311,10 +336,19 @@ public class SPARQLQueries {
 			Set<String> names = new LinkedHashSet<>();
 			plan.replacements().forEach(replacement -> names.add(replacement.variable().getName()));
 			plan.serviceInputs().values().forEach(inputs -> names.addAll(inputs.keySet()));
-			reads = Set.copyOf(names);
-			validated.put(context, reads);
-			return reads;
+			plan.apply();
+			var facts = new SavedServiceFacts(Set.copyOf(names), serviceOutputFacts(parsed));
+			validated.put(context, facts);
+			return facts;
 		}
+
+		private static QueryAlgebraBindingAnalysis.OutputFacts serviceOutputFacts(TupleExpr expression) {
+			return QueryAlgebraBindingAnalysis.withBindingValues(expression, EmptyBindingSet.getInstance())
+					.outputFacts(expression);
+		}
+	}
+
+	private record SavedServiceFacts(Set<String> reads, QueryAlgebraBindingAnalysis.OutputFacts outputs) {
 	}
 
 	private record SavedReadContext(String source, String baseURI, Map<String, Object> values) {
@@ -398,6 +432,7 @@ public class SPARQLQueries {
 			}
 			Service invocation = Service.fromBody(service.getServiceRef().clone(), ask.getArg().clone(), bodySource,
 					service.getPrefixDeclarations(), service.getBaseURI(), service.isSilent());
+			service.getRuntimeEndpointBindings().forEach(invocation::recordRuntimeEndpointBinding);
 			invocation.setPreparedBindingRequest(
 					new Service.PreparedBindingRequest(logicalSource, service.getBaseURI(), captured,
 							invocation.getAskQueryString()));

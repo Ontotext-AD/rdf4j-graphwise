@@ -67,6 +67,11 @@ public class Service extends UnaryTupleOperator {
 	private Map<String, Value> preparedInputBindings = Map.of();
 	private PreparedBindingRequest preparedBindingRequest;
 	private volatile RuntimeBindingHistory runtimeBindingHistory = EMPTY_HISTORY;
+	// A custom optimizer can fix the endpoint using a different Var. Retain its public input independently of that Var.
+	private Map<String, Value> runtimeEndpointBindings = Map.of();
+	// Only a freshly constructed SERVICE can certify that ordinary rewrites have not erased parameter reads.
+	private boolean acceptsNewPreparedInputs = true;
+	private Set<String> inputsSpecializedBeforeOptimization = Set.of();
 	private volatile SavedBindingNames savedBindingNames;
 	private transient volatile ExistsScopeFacts existsScopeFacts;
 	private Set<String> bnodeReferenceVarNames = Set.of();
@@ -129,6 +134,15 @@ public class Service extends UnaryTupleOperator {
 		if (runtimeBindingHistory == null) {
 			runtimeBindingHistory = EMPTY_HISTORY;
 		}
+		if (runtimeEndpointBindings == null) {
+			// Older streams cannot distinguish a fixed endpoint from a previously specialized variable.
+			runtimeEndpointBindings = Map.of();
+			markUntrackedServiceRewrite();
+		}
+		if (inputsSpecializedBeforeOptimization == null) {
+			// Earlier streams have no record of ordinary optimization. Their missing boolean is false.
+			inputsSpecializedBeforeOptimization = Set.of();
+		}
 	}
 
 	/** Captures the input values without retaining the caller's mutable binding set. */
@@ -170,6 +184,47 @@ public class Service extends UnaryTupleOperator {
 	@InternalUseOnly
 	public RuntimeBindingHistory getRuntimeBindingHistory() {
 		return runtimeBindingHistory;
+	}
+
+	/** Public input used by a custom optimizer to specialize this occurrence's endpoint selector. */
+	@InternalUseOnly
+	public Map<String, Value> getRuntimeEndpointBindings() {
+		return runtimeEndpointBindings;
+	}
+
+	/** Whether the endpoint is fixed independently of an API binding. */
+	@InternalUseOnly
+	public boolean hasFixedEndpoint() {
+		return serviceRef.hasValue() && !serviceRef.hasApiInputOrigin() && runtimeEndpointBindings.isEmpty();
+	}
+
+	@InternalUseOnly
+	public void recordRuntimeEndpointBinding(String name, Value value) {
+		if (runtimeEndpointBindings.isEmpty()) {
+			runtimeEndpointBindings = Map.of(name, value);
+		} else if (!value.equals(runtimeEndpointBindings.get(name))) {
+			markUntrackedServiceRewrite();
+		}
+	}
+
+	/** Records which inputs were fully specialized before ordinary rewrites could discard their reads. */
+	@InternalUseOnly
+	public void recordRuntimeOptimization(Set<String> specialized) {
+		if (acceptsNewPreparedInputs) {
+			inputsSpecializedBeforeOptimization = Set.copyOf(specialized);
+			acceptsNewPreparedInputs = false;
+		} else if (!specialized.containsAll(inputsSpecializedBeforeOptimization)) {
+			var remaining = new HashSet<>(inputsSpecializedBeforeOptimization);
+			remaining.retainAll(specialized);
+			inputsSpecializedBeforeOptimization = Set.copyOf(remaining);
+		}
+	}
+
+	/** An ordinary rewrite may rely on every missing input remaining absent. */
+	@InternalUseOnly
+	public boolean permitsPreparedReads(Set<String> reads) {
+		return !hasUntrackedServiceRewrite()
+				&& (acceptsNewPreparedInputs || inputsSpecializedBeforeOptimization.containsAll(reads));
 	}
 
 	/** Retains the original input name; later optimizer renames cannot identify that name from an origin bit. */
@@ -441,6 +496,10 @@ public class Service extends UnaryTupleOperator {
 					&& preparedInputBindings.equals(o.preparedInputBindings)
 					&& Objects.equals(preparedBindingRequest, o.preparedBindingRequest)
 					&& runtimeBindingHistory.equals(o.runtimeBindingHistory)
+					&& runtimeEndpointBindings.equals(o.runtimeEndpointBindings)
+					&& hasUntrackedServiceRewrite() == o.hasUntrackedServiceRewrite()
+					&& acceptsNewPreparedInputs == o.acceptsNewPreparedInputs
+					&& inputsSpecializedBeforeOptimization.equals(o.inputsSpecializedBeforeOptimization)
 					&& bnodeReferenceVarNames.equals(o.bnodeReferenceVarNames)
 					&& reservedBNodeIDs.equals(o.reservedBNodeIDs)
 					&& containedBNodeReferenceSyntax == o.containedBNodeReferenceSyntax;
@@ -453,6 +512,9 @@ public class Service extends UnaryTupleOperator {
 		return super.hashCode() ^ serviceRef.hashCode() ^ preparedInputBindings.hashCode()
 				^ Objects.hashCode(preparedBindingRequest)
 				^ runtimeBindingHistory.hashCode()
+				^ runtimeEndpointBindings.hashCode()
+				^ Boolean.hashCode(acceptsNewPreparedInputs)
+				^ inputsSpecializedBeforeOptimization.hashCode()
 				^ bnodeReferenceVarNames.hashCode()
 				^ reservedBNodeIDs.hashCode();
 	}

@@ -97,6 +97,7 @@ import org.eclipse.rdf4j.query.algebra.Projection;
 import org.eclipse.rdf4j.query.algebra.ProjectionElem;
 import org.eclipse.rdf4j.query.algebra.ProjectionElemList;
 import org.eclipse.rdf4j.query.algebra.QueryModelNode;
+import org.eclipse.rdf4j.query.algebra.QueryModelVisitor;
 import org.eclipse.rdf4j.query.algebra.QueryRoot;
 import org.eclipse.rdf4j.query.algebra.Reduced;
 import org.eclipse.rdf4j.query.algebra.Regex;
@@ -648,6 +649,16 @@ public final class QueryAlgebraBindingAnalysis {
 		if (!visitor.visit(node, input)) {
 			return;
 		}
+		visitBindingChildren(node, new AbstractQueryModelVisitor<RuntimeException>() {
+			@Override
+			protected void meetNode(QueryModelNode child) {
+				visitScoped(child, childInput(node, child, input), visitor);
+			}
+		});
+	}
+
+	/** Visits immediate children whose bindings are evaluated, including inputs outside ordinary model traversal. */
+	static <X extends Exception> void visitBindingChildren(QueryModelNode node, QueryModelVisitor<X> visitor) throws X {
 		if (node instanceof ExtensionElem element && !TupleExprs.isEvaluatedExtensionElement(element)) {
 			// Root aggregate expressions only describe values computed by Group. ExtensionIterator never
 			// evaluates their children, so they do not introduce binding reads or reachable runtime scopes.
@@ -657,24 +668,15 @@ public final class QueryAlgebraBindingAnalysis {
 			// The parser's separate rdf:reifies statement owns the reifier read.
 			for (Var variable : tripleLookupVariables(reference)) {
 				if (variable != null) {
-					visitScoped(variable, childInput(reference, variable, input), visitor);
+					variable.visit(visitor);
 				}
 			}
 			return;
 		}
-		node.visitChildren(new AbstractQueryModelVisitor<RuntimeException>() {
-			@Override
-			protected void meetNode(QueryModelNode child) {
-				visitScoped(child, childInput(node, child, input), visitor);
-			}
-		});
-		if (node instanceof GroupConcat concat && concat.getSeparator() != null) {
-			ValueExpr separator = concat.getSeparator();
-			visitScoped(separator, childInput(node, separator, input), visitor);
-		}
+		node.visitChildren(visitor);
+		TupleExprs.visitGroupConcatSeparator(node, visitor);
 		if (node instanceof Projection projection && projection.getProjectionContext() != null) {
-			visitScoped(projection.getProjectionContext(), childInput(node, projection.getProjectionContext(), input),
-					visitor);
+			projection.getProjectionContext().visit(visitor);
 		}
 	}
 

@@ -33,15 +33,21 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.common.iteration.CloseableIteratorIteration;
 import org.eclipse.rdf4j.http.client.SPARQLProtocolSession;
 import org.eclipse.rdf4j.model.BNode;
@@ -57,21 +63,32 @@ import org.eclipse.rdf4j.query.MalformedQueryException;
 import org.eclipse.rdf4j.query.MutableBindingSet;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
 import org.eclipse.rdf4j.query.QueryLanguage;
+import org.eclipse.rdf4j.query.QueryResults;
 import org.eclipse.rdf4j.query.TupleQuery;
+import org.eclipse.rdf4j.query.algebra.EmptySet;
+import org.eclipse.rdf4j.query.algebra.Filter;
 import org.eclipse.rdf4j.query.algebra.QueryModelNode;
 import org.eclipse.rdf4j.query.algebra.QueryModelVisitor;
+import org.eclipse.rdf4j.query.algebra.QueryRoot;
 import org.eclipse.rdf4j.query.algebra.Service;
 import org.eclipse.rdf4j.query.algebra.StatementPattern;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.UnaryTupleOperator;
 import org.eclipse.rdf4j.query.algebra.Var;
+import org.eclipse.rdf4j.query.algebra.evaluation.QueryEvaluationStep;
+import org.eclipse.rdf4j.query.algebra.evaluation.QueryOptimizer;
+import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedService;
+import org.eclipse.rdf4j.query.algebra.evaluation.impl.DefaultEvaluationStrategy;
+import org.eclipse.rdf4j.query.algebra.evaluation.impl.EvaluationStatistics;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.GraphFrameBindings;
+import org.eclipse.rdf4j.query.algebra.evaluation.impl.QueryEvaluationContext;
 import org.eclipse.rdf4j.query.algebra.evaluation.optimizer.BindingAssignerOptimizer;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractQueryModelVisitor;
 import org.eclipse.rdf4j.query.algebra.helpers.BindingAnalysisContract;
 import org.eclipse.rdf4j.query.algebra.helpers.QueryAlgebraBindingAnalysis;
 import org.eclipse.rdf4j.query.algebra.helpers.QueryAlgebraBindingAnalysis.OutputFacts;
 import org.eclipse.rdf4j.query.algebra.helpers.QueryAlgebraBindingAnalysis.ReadOnlyContext;
+import org.eclipse.rdf4j.query.impl.BindingSetSnapshots;
 import org.eclipse.rdf4j.query.impl.BlankNodeAllocationScope;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
 import org.eclipse.rdf4j.query.impl.IteratingTupleQueryResult;
@@ -84,15 +101,719 @@ import org.eclipse.rdf4j.query.parser.sparql.ast.SyntaxTreeBuilder;
 import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.base.RepositoryConnectionWrapper;
 import org.eclipse.rdf4j.repository.base.RepositoryWrapper;
+import org.eclipse.rdf4j.repository.evaluation.RepositoryTripleSource;
 import org.eclipse.rdf4j.repository.sail.SailRepository;
 import org.eclipse.rdf4j.repository.sail.SailTupleQuery;
 import org.eclipse.rdf4j.repository.sparql.SPARQLRepository;
 import org.eclipse.rdf4j.repository.sparql.federation.RepositoryFederatedService;
+import org.eclipse.rdf4j.sail.SailException;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentMatchers;
 
 class ServicePreparedQueryBindingTest {
 	private static final SimpleValueFactory VF = SimpleValueFactory.getInstance();
+
+	@Test
+	void ordinaryOptimizationCannotSilentlyDiscardSavedServiceReadDuringPreparation() throws Exception {
+		String query = "SELECT ?s WHERE { SERVICE <urn:endpoint> { ?s <urn:p> \"first\" FILTER(BOUND(?x)) } }";
+		var expected = new MapBindingSet();
+		expected.addBinding("s", VF.createIRI("urn:a"));
+		try (Harness harness = new Harness(false)) {
+			assertServicePreparationPreservesRow(harness, query, expected);
+		}
+	}
+
+	@Test
+	void survivingUnionReadCannotHideAnErasedServiceOutput() throws Exception {
+		String query = "SELECT ?s WHERE { SERVICE <urn:endpoint> { { ?s <urn:p> ?o FILTER(BOUND(?x)) }"
+				+ " UNION { ?x <urn:nothing> ?other } } }";
+		var subject = VF.createIRI("urn:s");
+		var expected = new MapBindingSet();
+		expected.addBinding("s", subject);
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			data.clear();
+			data.add(subject, VF.createIRI("urn:p"), VF.createIRI("urn:o"));
+			assertServicePreparationPreservesRow(harness, query, expected);
+		}
+	}
+
+	@Test
+	void identicalServiceColumnsDoNotProveAnErasedUnionArmPreservesMultiplicity() throws Exception {
+		assertErasedServiceArmPreservesMultiplicity(null);
+	}
+
+	@Test
+	void customOptimizerReplacingServiceCannotDiscardItsRuntimeProvenance() throws Exception {
+		assertErasedServiceArmPreservesMultiplicity(reconstructService());
+	}
+
+	@Test
+	void customOptimizerChangingSavedSourceCannotDiscardAnEarlierServiceRead() throws Exception {
+		String query = "SELECT ?s WHERE { SERVICE <urn:ep> { ?s <urn:p> ?o FILTER(BOUND(?x)) } }";
+		var subject = VF.createIRI("urn:s");
+		var expected = new MapBindingSet();
+		expected.addBinding("s", subject);
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			data.clear();
+			data.add(subject, VF.createIRI("urn:p"), VF.createIRI("urn:o"));
+			assertServicePreparationPreservesRow(harness, query,
+					(root, dataset, bindings) -> root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+						@Override
+						public void meet(Service service) {
+							service.setArg(new EmptySet());
+							service.setExpressionString("{ FILTER(false) }");
+						}
+					}), expected);
+		}
+	}
+
+	@Test
+	void failedOptimizerIntroducingFirstServiceCannotLeaveCallerWithAReusableStaleTree() throws Exception {
+		var expression = new SPARQLParser()
+				.parseQuery("SELECT ?s WHERE { ?s <urn:p> ?o FILTER(BOUND(?x)) }", null)
+				.getTupleExpr();
+		var empty = EmptyBindingSet.getInstance();
+		var parameters = new MapBindingSet();
+		parameters.addBinding("x", VF.createLiteral(true));
+		var expected = new MapBindingSet();
+		var subject = VF.createIRI("urn:s");
+		expected.addBinding("s", subject);
+		var statistics = new EvaluationStatistics();
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			data.clear();
+			data.add(subject, VF.createIRI("urn:p"), VF.createIRI("urn:o"));
+			var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint);
+			var fresh = strategy.optimizeForEmptyInput(expression, statistics, parameters);
+			try (var rows = strategy.precompile(fresh).evaluate(empty)) {
+				assertThat(QueryResults.asList(rows)).as("fresh preparation").containsExactly(expected);
+			}
+			var failure = new IllegalStateException("custom optimizer failed after rewriting");
+			var custom = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint);
+			custom.setOptimizerPipeline(() -> List.of((root, dataset, bindings) -> {
+				root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+					@Override
+					public void meet(Filter filter) {
+						filter.replaceWith(Service.fromBody(Var.of("endpoint", VF.createIRI("urn:ep"), true, true),
+								new EmptySet(), "FILTER(false)", Map.of(), null, false));
+					}
+				});
+				throw failure;
+			}));
+			for (TupleExpr input : List.of(expression.clone(), ((QueryRoot) expression).getArg().clone())) {
+				assertThatThrownBy(() -> custom.optimize(input, statistics, empty)).isSameAs(failure);
+				assertRepreparedRows(harness, strategy, input, parameters, expected);
+			}
+		}
+	}
+
+	@Test
+	void changingOnlyTheBaseOfARelativeServiceRequestInvalidatesStrictReuse() throws Exception {
+		String text = "SELECT ?v WHERE { SERVICE <urn:ep> { BIND(<relative> AS ?v) } }";
+		var empty = EmptyBindingSet.getInstance();
+		var statistics = new EvaluationStatistics();
+		try (Harness harness = new Harness(false); var connection = harness.sender.getConnection()) {
+			var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(connection), null,
+					ignored -> harness.endpoint);
+			strategy.setOptimizerPipeline(() -> List
+					.of((root, dataset, inputs) -> root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+						@Override
+						public void meet(Service service) {
+							service.setBaseURI("http://new.example/");
+						}
+					})));
+			var expression = new SPARQLParser().parseQuery(text, "http://old.example/").getTupleExpr();
+			var optimized = strategy.optimize(expression, statistics, empty);
+			assertThatThrownBy(() -> strategy.optimizeForEmptyInput(optimized, statistics, empty))
+					.isInstanceOf(QueryEvaluationException.class)
+					.hasMessageContaining("SERVICE");
+		}
+	}
+
+	@Test
+	void preparedServiceEndpointRespectsItsOriginalRuntimeParameter() throws Exception {
+		String query = "SELECT ?s WHERE { SERVICE ?ep { ?s <urn:p> ?o } }";
+		var endpointA = VF.createIRI("urn:endpoint:a");
+		var endpointB = VF.createIRI("urn:endpoint:b");
+		var subjectA = VF.createIRI("urn:a");
+		var subjectB = VF.createIRI("urn:b");
+		var parametersA = new MapBindingSet();
+		parametersA.addBinding("ep", endpointA);
+		var parametersB = new MapBindingSet();
+		parametersB.addBinding("ep", endpointB);
+		var statistics = new EvaluationStatistics();
+		try (Harness a = new Harness(false);
+				Harness b = new Harness(false);
+				var dataA = a.data.getConnection();
+				var dataB = b.data.getConnection()) {
+			dataA.clear();
+			dataB.clear();
+			dataA.add(subjectA, VF.createIRI("urn:p"), VF.createIRI("urn:o"));
+			dataB.add(subjectB, VF.createIRI("urn:p"), VF.createIRI("urn:o"));
+			var endpoints = Map.of(endpointA.stringValue(), a.endpoint, endpointB.stringValue(), b.endpoint);
+			var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(dataA), null, endpoints::get);
+			var expression = new SPARQLParser().parseQuery(query, null).getTupleExpr();
+			assertEndpointRow(strategy, strategy.optimizeForEmptyInput(expression, statistics, parametersB), subjectB);
+
+			for (boolean rename : List.of(false, true)) {
+				var custom = new DefaultEvaluationStrategy(new RepositoryTripleSource(dataA), null, endpoints::get);
+				custom.setOptimizerPipeline(() -> List
+						.of((root, dataset, bindings) -> root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+							@Override
+							public void meet(Service service) {
+								Var ref = service.getServiceRef();
+								service.setServiceRef(Var.of(rename ? "internal" : ref.getName(),
+										bindings.getValue(ref.getName()), ref.isAnonymous(), ref.isConstant()));
+							}
+						})));
+				var optimized = custom.optimize(expression.clone(), statistics, parametersA);
+				assertEndpointRow(strategy, strategy.optimizeForEmptyInput(optimized, statistics, parametersA),
+						subjectA);
+				long calls = a.providerRequestCount() + b.providerRequestCount();
+				TupleExpr changed;
+				try {
+					changed = strategy.optimizeForEmptyInput(optimized, statistics, parametersB);
+				} catch (QueryEvaluationException unsupported) {
+					assertThat(unsupported).hasMessageContaining("SERVICE");
+					assertThat(a.providerRequestCount() + b.providerRequestCount()).isEqualTo(calls);
+					continue;
+				}
+				assertEndpointRow(strategy, changed, subjectB);
+			}
+		}
+	}
+
+	private static void assertEndpointRow(DefaultEvaluationStrategy strategy, TupleExpr expression, Value subject) {
+		var expected = new MapBindingSet();
+		expected.addBinding("s", subject);
+		try (var rows = strategy.precompile(expression).evaluate(EmptyBindingSet.getInstance())) {
+			assertThat(QueryResults.asList(rows)).containsExactly(expected);
+		}
+	}
+
+	@Test
+	void renamedRuntimeServiceEndpointRetainsItsProjectedPublicBinding() throws Exception {
+		var parameters = new MapBindingSet();
+		var endpoint = VF.createIRI("urn:endpoint:a");
+		parameters.addBinding("ep", endpoint);
+		var subject = VF.createIRI("urn:a");
+		var expected = new MapBindingSet();
+		expected.addBinding("ep", endpoint);
+		expected.addBinding("s", subject);
+		var statistics = new EvaluationStatistics();
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			data.clear();
+			data.add(subject, VF.createIRI("urn:p"), VF.createIRI("urn:one"));
+			data.add(subject, VF.createIRI("urn:p"), VF.createIRI("urn:two"));
+			var reader = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint);
+			String serviceBody = "SERVICE ?ep { ?s <urn:p> ?o }";
+			for (boolean nested : List.of(false, true)) {
+				String query = nested
+						? "SELECT ?ep ?s ?private_ep WHERE { { SELECT ?ep ?s ?private_ep WHERE { " + serviceBody
+								+ " } } }"
+						: "SELECT ?ep ?s WHERE { " + serviceBody + " }";
+				String privateName = nested ? "private_ep" : "private-ep";
+				var expression = new SPARQLParser().parseQuery(query, null).getTupleExpr();
+				var fresh = reader.optimizeForEmptyInput(expression, statistics, parameters);
+				try (var rows = reader.precompile(fresh).evaluate(EmptyBindingSet.getInstance())) {
+					assertThat(QueryResults.asList(rows)).containsExactly(expected, expected);
+				}
+				var custom = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+						ignored -> harness.endpoint);
+				custom.setOptimizerPipeline(() -> List
+						.of((root, dataset, inputs) -> root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+							@Override
+							public void meet(Service service) {
+								service.setServiceRef(Var.of(privateName, inputs.getValue("ep"), false, false));
+							}
+						})));
+				var optimized = custom.optimize(expression, statistics, parameters);
+				var caller = new MapBindingSet();
+				parameters.forEach(caller::addBinding);
+				var ordinary = new MapBindingSet();
+				expected.forEach(ordinary::addBinding);
+				if (nested) {
+					caller.addBinding(privateName, VF.createLiteral("caller"));
+					ordinary.addBinding(privateName, VF.createLiteral("caller"));
+				}
+				try (var rows = reader.precompile(optimized).evaluate(caller)) {
+					assertThat(QueryResults.asList(rows)).containsExactly(ordinary, ordinary);
+				}
+				var prepared = reader.optimizeForEmptyInput(optimized, statistics, parameters);
+				try (var rows = reader.precompile(prepared).evaluate(EmptyBindingSet.getInstance())) {
+					assertThat(QueryResults.asList(rows)).as("recovered public endpoint and row multiplicity")
+							.containsExactly(expected, expected);
+				}
+			}
+		}
+	}
+
+	@Test
+	void boundJoinRecoversThePublicEndpointAtItsOwningProjection() throws Exception {
+		String query = "SELECT ?ep ?s WHERE { VALUES ?i { 1 2 } SERVICE ?ep { ?s <urn:p> 'first' } }";
+		var expression = new SPARQLParser().parseQuery(query, null).getTupleExpr();
+		var parameters = new MapBindingSet();
+		var endpoint = VF.createIRI("urn:endpoint:a");
+		parameters.addBinding("ep", endpoint);
+		var expected = new MapBindingSet();
+		expected.addBinding("ep", endpoint);
+		expected.addBinding("s", VF.createIRI("urn:a"));
+		var statistics = new EvaluationStatistics();
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			var reader = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint);
+			var custom = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint);
+			custom.setOptimizerPipeline(() -> List
+					.of((root, dataset, inputs) -> root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+						@Override
+						public void meet(Service service) {
+							service.setServiceRef(Var.of("private-ep", inputs.getValue("ep")));
+						}
+					})));
+			TupleExpr optimized = custom.optimize(expression.clone(), statistics, parameters);
+			for (TupleExpr plan : List.of(optimized, expression)) {
+				var prepared = reader.optimizeForEmptyInput(plan, statistics, parameters);
+				try (var rows = reader.precompile(prepared).evaluate(EmptyBindingSet.getInstance())) {
+					assertThat(QueryResults.asList(rows)).containsExactly(expected, expected);
+				}
+			}
+		}
+	}
+
+	@Test
+	void groupedVectorServiceReceivesTheProjectedEndpointOnEachSolution() throws Exception {
+		String query = "SELECT ?ep (COUNT(*) AS ?n) WHERE { VALUES ?i { 1 2 } "
+				+ "SERVICE ?ep { ?s <urn:p> 'first' } } GROUP BY ?ep";
+		var expression = new SPARQLParser().parseQuery(query, null).getTupleExpr();
+		var parameters = new MapBindingSet();
+		var endpoint = VF.createIRI("urn:endpoint:a");
+		parameters.addBinding("ep", endpoint);
+		var expected = new MapBindingSet();
+		expected.addBinding("ep", endpoint);
+		expected.addBinding("n", VF.createLiteral("2", XSD.INTEGER));
+		var statistics = new EvaluationStatistics();
+		var preparedResults = new LinkedHashMap<String, List<BindingSet>>();
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			var external = mock(FederatedService.class);
+			when(external.preservesBNodeResultProvenance()).thenReturn(true);
+			when(external.preservesCallerBindingDomain()).thenReturn(true);
+			when(external.evaluate(any(), any(), nullable(String.class))).thenAnswer(call -> {
+				var matching = new MapBindingSet();
+				matching.addBinding("s", VF.createIRI("urn:a"));
+				List<BindingSet> results = new ArrayList<>();
+				try (CloseableIteration<BindingSet> inputs = call.getArgument(1)) {
+					while (inputs.hasNext()) {
+						BindingSet caller = RemoteBNode.originalBindings(inputs.next());
+						results.add(BindingSetSnapshots.mergeWithPrecedence(caller, matching));
+					}
+				}
+				return new CloseableIteratorIteration<>(results.iterator());
+			});
+			for (FederatedService provider : List.of(harness.endpoint, external)) {
+				var reader = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null, ignored -> provider);
+				var custom = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null, ignored -> provider);
+				custom.setOptimizerPipeline(() -> List
+						.of((root, dataset, bindings) -> root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+							@Override
+							public void meet(Service service) {
+								service.setServiceRef(Var.of("private-ep", bindings.getValue("ep")));
+							}
+						})));
+				var optimized = custom.optimize(expression.clone(), statistics, parameters);
+				try (var rows = reader.precompile(optimized).evaluate(parameters)) {
+					assertThat(QueryResults.asList(rows)).as("ordinary input").containsExactly(expected);
+				}
+				for (TupleExpr plan : List.of(expression, optimized)) {
+					var prepared = reader.optimizeForEmptyInput(plan, statistics, parameters);
+					try (var rows = reader.precompile(prepared).evaluate(EmptyBindingSet.getInstance())) {
+						String route = provider == external ? "external" : "repository";
+						preparedResults.put(route + (plan == expression ? " fresh" : " reused"),
+								QueryResults.asList(rows));
+					}
+				}
+				verify(provider, times(3)).evaluate(any(), any(), nullable(String.class));
+			}
+		}
+		assertThat(preparedResults).allSatisfy((route, rows) -> assertThat(rows).as(route).containsExactly(expected));
+	}
+
+	@Test
+	void groupedServiceEndpointIsStillACallerInputWhenItsBodyReadsTheSameParameter() throws Exception {
+		String query = "SELECT ?ep (COUNT(*) AS ?n) WHERE { VALUES ?i { 1 2 } "
+				+ "SERVICE ?ep { ?s <urn:p> 'first' FILTER(sameTerm(?ep, <urn:endpoint:a>)) } } GROUP BY ?ep";
+		var expression = new SPARQLParser().parseQuery(query, null).getTupleExpr();
+		var parameters = new MapBindingSet();
+		parameters.addBinding("ep", VF.createIRI("urn:endpoint:a"));
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			var reader = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint);
+			List<BindingSet> ordinary;
+			try (var rows = reader.precompile(expression).evaluate(parameters)) {
+				ordinary = QueryResults.asList(rows);
+			}
+			assertThat(ordinary).singleElement().satisfies(row -> {
+				assertThat(row.getValue("ep")).isEqualTo(parameters.getValue("ep"));
+				assertThat(row.getValue("n")).isEqualTo(VF.createLiteral("2", XSD.INTEGER));
+			});
+			var prepared = reader.optimizeForEmptyInput(expression, new EvaluationStatistics(), parameters);
+			try (var rows = reader.precompile(prepared).evaluate(EmptyBindingSet.getInstance())) {
+				assertThat(QueryResults.asList(rows)).containsExactlyElementsOf(ordinary);
+			}
+		}
+	}
+
+	@Test
+	void runtimeEndpointOwnershipSurvivesSerializationWithoutReplacingTheOptimizerSelector() throws Exception {
+		String query = "SELECT ?s WHERE { SERVICE ?ep { ?s <urn:p> 'first' } }";
+		var expression = new SPARQLParser().parseQuery(query, null).getTupleExpr();
+		var parameters = new MapBindingSet();
+		parameters.addBinding("ep", VF.createIRI("urn:chosen"));
+		var different = new MapBindingSet();
+		different.addBinding("ep", VF.createIRI("urn:other"));
+		var statistics = new EvaluationStatistics();
+		var produced = new AtomicReference<Var>();
+		var observed = new AtomicReference<Var>();
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint);
+			QueryOptimizer specialize = (root, dataset, inputs) -> root
+					.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+						@Override
+						public void meet(Service service) {
+							Var chosen = Var.of("internal", inputs.getValue(service.getServiceRef().getName()));
+							service.setServiceRef(chosen);
+							produced.set(chosen);
+						}
+					});
+			QueryOptimizer observe = (root, dataset, inputs) -> root
+					.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+						@Override
+						public void meet(Service service) {
+							observed.set(service.getServiceRef());
+						}
+					});
+			strategy.setOptimizerPipeline(() -> List.of(specialize, observe));
+			TupleExpr optimized = strategy.optimize(expression, statistics, parameters);
+			assertEndpointRow(strategy, optimized, VF.createIRI("urn:a"));
+			var bytes = new ByteArrayOutputStream();
+			try (var stream = new ObjectOutputStream(bytes)) {
+				stream.writeObject(optimized);
+			}
+			TupleExpr restored;
+			try (var stream = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+				restored = (TupleExpr) stream.readObject();
+			}
+			var reader = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint);
+			assertEndpointRow(reader, reader.optimizeForEmptyInput(restored, statistics, parameters),
+					VF.createIRI("urn:a"));
+			long calls = harness.providerRequestCount();
+			assertAll(
+					() -> assertThat(observed.get()).as("selector passed between custom optimizers")
+							.isSameAs(produced.get()),
+					() -> assertThatThrownBy(() -> reader.optimizeForEmptyInput(restored, statistics, different))
+							.isInstanceOf(QueryEvaluationException.class)
+							.hasMessageContaining("SERVICE"),
+					() -> assertThatThrownBy(
+							() -> reader.optimizeForEmptyInput(restored, statistics, EmptyBindingSet.getInstance()))
+									.isInstanceOf(QueryEvaluationException.class)
+									.hasMessageContaining("SERVICE"),
+					() -> assertThat(harness.providerRequestCount()).isEqualTo(calls));
+		}
+	}
+
+	@Test
+	void optimizerFailureRemainsPrimaryWhenItsPartialTreeCannotBeInspected() throws Exception {
+		var failure = new IllegalStateException("optimizer left a partial tree");
+		try (Harness harness = new Harness(false); var connection = harness.sender.getConnection()) {
+			var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(connection), null,
+					ignored -> harness.endpoint);
+			strategy.setOptimizerPipeline(() -> List.of((root, dataset, inputs) -> {
+				((QueryRoot) root).setArg(new Filter());
+				throw failure;
+			}));
+			var expression = new SPARQLParser().parseQuery("SELECT ?v WHERE { VALUES ?v { 1 } }", null).getTupleExpr();
+			assertThatThrownBy(
+					() -> strategy.optimize(expression, new EvaluationStatistics(), EmptyBindingSet.getInstance()))
+							.isSameAs(failure);
+			assertThat(failure.getSuppressed()).singleElement().isInstanceOf(NullPointerException.class);
+		}
+	}
+
+	@Test
+	void failedOptimizerCannotDiscardServiceProvenanceFromATransparentExtensionRoot() throws Exception {
+		String query = "SELECT ?s WHERE { SERVICE <urn:ep> { ?s <urn:p> ?o FILTER(BOUND(?x)) } }";
+		var tree = new TransparentTupleRoot(new SPARQLParser().parseQuery(query, null).getTupleExpr());
+		var statistics = new EvaluationStatistics();
+		var parameters = new MapBindingSet();
+		parameters.addBinding("x", VF.createLiteral(true));
+		var subject = VF.createIRI("urn:s");
+		var expected = new MapBindingSet();
+		expected.addBinding("s", subject);
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			data.clear();
+			data.add(subject, VF.createIRI("urn:p"), VF.createIRI("urn:o"));
+			var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint) {
+				@Override
+				public QueryEvaluationStep precompile(TupleExpr expression) {
+					return super.precompile(
+							expression instanceof TransparentTupleRoot root ? root.inner() : expression);
+				}
+
+				@Override
+				public QueryEvaluationStep precompile(TupleExpr expression, QueryEvaluationContext context) {
+					return super.precompile(expression instanceof TransparentTupleRoot root ? root.inner() : expression,
+							context);
+				}
+			};
+			assertEndpointRow(strategy, strategy.optimizeForEmptyInput(tree, statistics, parameters), subject);
+			var custom = new DefaultEvaluationStrategy(new RepositoryTripleSource(data), null,
+					ignored -> harness.endpoint);
+			var failure = new IllegalStateException("optimizer failed after removing SERVICE");
+			custom.setOptimizerPipeline(() -> List.of((root, dataset, inputs) -> {
+				root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+					@Override
+					public void meet(Service service) {
+						service.replaceWith(new EmptySet());
+					}
+				});
+				throw failure;
+			}));
+			assertThatThrownBy(() -> custom.optimize(tree, statistics, EmptyBindingSet.getInstance()))
+					.isSameAs(failure);
+			assertRepreparedRows(harness, strategy, tree, parameters, expected);
+		}
+	}
+
+	private record TransparentTupleRoot(TupleExpr inner) implements TupleExpr {
+		@Override
+		public Set<String> getBindingNames() {
+			return inner.getBindingNames();
+		}
+
+		@Override
+		public Set<String> getAssuredBindingNames() {
+			return inner.getAssuredBindingNames();
+		}
+
+		@Override
+		public <X extends Exception> void visit(QueryModelVisitor<X> visitor) throws X {
+			inner.visit(visitor);
+		}
+
+		@Override
+		public <X extends Exception> void visitChildren(QueryModelVisitor<X> visitor) throws X {
+			inner.visitChildren(visitor);
+		}
+
+		@Override
+		public QueryModelNode getParentNode() {
+			return inner.getParentNode();
+		}
+
+		@Override
+		public void setParentNode(QueryModelNode parent) {
+			inner.setParentNode(parent);
+		}
+
+		@Override
+		public void replaceChildNode(QueryModelNode current, QueryModelNode replacement) {
+			inner.replaceChildNode(current, replacement);
+		}
+
+		@Override
+		public void replaceWith(QueryModelNode replacement) {
+			inner.replaceWith(replacement);
+		}
+
+		@Override
+		public String getSignature() {
+			return inner.getSignature();
+		}
+
+		@Override
+		public TransparentTupleRoot clone() {
+			return new TransparentTupleRoot(inner.clone());
+		}
+	}
+
+	private static QueryOptimizer reconstructService() {
+		return (root, dataset, bindings) -> root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+			@Override
+			public void meet(Service service) {
+				service.replaceWith(Service.fromBody(service.getServiceRef().clone(), service.getServiceExpr().clone(),
+						service.getServiceExpressionString(), service.getPrefixDeclarations(), service.getBaseURI(),
+						service.isSilent()));
+			}
+		});
+	}
+
+	@Test
+	void ordinarySailEvaluationWithoutParametersExecutesAnUntrackedServiceRewrite() throws Exception {
+		String query = "SELECT ?v WHERE { SERVICE <urn:endpoint> { VALUES ?v { 1 } } }";
+		var statistics = new EvaluationStatistics();
+		var empty = EmptyBindingSet.getInstance();
+		try (Harness harness = new Harness(false); var connection = harness.sender.getConnection()) {
+			var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(connection), null,
+					ignored -> harness.endpoint);
+			strategy.setOptimizerPipeline(() -> List.of(reconstructService()));
+			var expression = new SPARQLParser().parseQuery(query, null).getTupleExpr();
+			var optimized = strategy.optimize(expression, statistics, empty);
+			try (var rows = strategy.precompile(optimized).evaluate(empty)) {
+				assertThat(QueryResults.asList(rows)).extracting(row -> row.getValue("v").stringValue())
+						.containsExactly("1");
+			}
+			assertThatThrownBy(() -> strategy.optimizeForEmptyInput(optimized, statistics, empty))
+					.isInstanceOf(QueryEvaluationException.class)
+					.hasMessageContaining("SERVICE");
+			var parameter = new MapBindingSet();
+			parameter.addBinding("v", VF.createLiteral(1));
+			var sail = connection.getSailConnection();
+			assertThatThrownBy(() -> sail.evaluate(optimized, null, parameter, true))
+					.isInstanceOf(SailException.class)
+					.hasMessageContaining("SERVICE");
+			try (var rows = sail.evaluate(optimized, null, empty, true)) {
+				assertThat(QueryResults.asList(rows)).extracting(row -> row.getValue("v").stringValue())
+						.containsExactly("1");
+			}
+		}
+	}
+
+	@Test
+	void customOptimizerClonesRetainTheProvenanceOfTheirOwnServiceOccurrence() throws Exception {
+		String arm = "{ SERVICE <urn:endpoint> { VALUES ?v { 1 } } }";
+		var empty = EmptyBindingSet.getInstance();
+		var statistics = new EvaluationStatistics();
+		try (Harness harness = new Harness(false); var connection = harness.sender.getConnection()) {
+			for (boolean copyFirstTwice : List.of(false, true)) {
+				var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(connection), null,
+						ignored -> harness.endpoint);
+				strategy.setOptimizerPipeline(() -> List.of((root, dataset, bindings) -> {
+					var first = new AtomicReference<Service>();
+					root.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+						@Override
+						public void meet(Service service) {
+							first.compareAndSet(null, service);
+							service.replaceWith((copyFirstTwice ? first.get() : service).clone());
+						}
+					});
+				}));
+				var expression = new SPARQLParser()
+						.parseQuery("SELECT ?v WHERE { " + arm + " UNION " + arm + " }", null)
+						.getTupleExpr();
+				var optimized = strategy.optimize(expression, statistics, empty);
+				try (var rows = strategy.precompile(optimized).evaluate(empty)) {
+					assertThat(QueryResults.asList(rows)).extracting(row -> row.getValue("v").stringValue())
+							.containsExactly("1", "1");
+				}
+				if (copyFirstTwice) {
+					assertThatThrownBy(() -> strategy.optimizeForEmptyInput(optimized, statistics, empty))
+							.isInstanceOf(QueryEvaluationException.class)
+							.hasMessageContaining("SERVICE");
+				} else {
+					strategy.optimizeForEmptyInput(optimized, statistics, empty);
+				}
+			}
+		}
+	}
+
+	private static void assertErasedServiceArmPreservesMultiplicity(QueryOptimizer additionalOptimizer)
+			throws Exception {
+		String query = "SELECT ?s ?x WHERE { SERVICE <urn:endpoint> {"
+				+ " { SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(BOUND(?x)) } }"
+				+ " UNION { VALUES ?s { <urn:absent> } ?s <urn:nothing> ?x } }"
+				+ " FILTER(sameTerm(?s, <urn:s>)) }";
+		var expected = new MapBindingSet();
+		expected.addBinding("x", VF.createLiteral(true));
+		var subject = VF.createIRI("urn:s");
+		expected.addBinding("s", subject);
+		try (Harness harness = new Harness(false); var data = harness.data.getConnection()) {
+			data.clear();
+			data.add(subject, VF.createIRI("urn:p"), VF.createIRI("urn:first"));
+			data.add(subject, VF.createIRI("urn:p"), VF.createIRI("urn:second"));
+			assertServicePreparationPreservesRow(harness, query, additionalOptimizer, expected, expected);
+		}
+	}
+
+	private static void assertServicePreparationPreservesRow(Harness harness, String query, BindingSet... expected) {
+		assertServicePreparationPreservesRow(harness, query, null, expected);
+	}
+
+	private static void assertServicePreparationPreservesRow(Harness harness, String query,
+			QueryOptimizer additionalOptimizer, BindingSet... expected) {
+		var parameters = new MapBindingSet();
+		parameters.addBinding("x", VF.createLiteral(true));
+		var empty = EmptyBindingSet.getInstance();
+		var statistics = new EvaluationStatistics();
+		try (var connection = harness.sender.getConnection()) {
+			var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(connection), null,
+					ignored -> harness.endpoint);
+			TupleExpr expression = QueryParserUtil.parseTupleQuery(QueryLanguage.SPARQL, query, null).getTupleExpr();
+			TupleExpr fresh = strategy.optimizeForEmptyInput(expression, statistics, parameters);
+			try (var rows = strategy.precompile(fresh).evaluate(empty)) {
+				assertThat(QueryResults.asList(rows)).as("fresh preparation").containsExactly(expected);
+			}
+			TupleExpr optimized = strategy.optimize(expression, statistics, empty);
+			if (additionalOptimizer != null) {
+				var custom = new DefaultEvaluationStrategy(new RepositoryTripleSource(connection), null,
+						ignored -> harness.endpoint);
+				custom.setOptimizerPipeline(() -> List.of(additionalOptimizer));
+				optimized = custom.optimize(optimized, statistics, empty);
+			}
+			assertRepreparedRows(harness, strategy, optimized, parameters, expected);
+		}
+	}
+
+	private static void assertRepreparedRows(Harness harness, DefaultEvaluationStrategy strategy, TupleExpr optimized,
+			BindingSet parameters, BindingSet... expected) {
+		long calls = harness.providerRequestCount();
+		TupleExpr prepared;
+		try {
+			prepared = strategy.optimizeForEmptyInput(optimized, new EvaluationStatistics(), parameters);
+		} catch (QueryEvaluationException unsupported) {
+			assertThat(unsupported).hasMessageContaining("SERVICE");
+			assertThat(harness.providerRequestCount()).isEqualTo(calls);
+			return;
+		}
+		try (var rows = strategy.precompile(prepared).evaluate(EmptyBindingSet.getInstance())) {
+			assertThat(QueryResults.asList(rows)).as("preparation after ordinary optimization")
+					.containsExactly(expected);
+		}
+	}
+
+	@Test
+	void emptyParameterRecaptureDetectsPreparedServiceInGroupConcatSeparator() throws Exception {
+		String query = "SELECT (GROUP_CONCAT(?v; SEPARATOR=IF(EXISTS {"
+				+ " SERVICE <urn:endpoint> { VALUES ?s { 1 } FILTER(?x) } }, \"Y\", \"N\")) AS ?result)"
+				+ " WHERE { VALUES ?v { \"v\" \"v\" } }";
+		TupleExpr expression = QueryParserUtil.parseTupleQuery(QueryLanguage.SPARQL, query, null).getTupleExpr();
+		var parameters = new MapBindingSet();
+		parameters.addBinding("x", VF.createLiteral(true));
+		var statistics = new EvaluationStatistics();
+		var empty = EmptyBindingSet.getInstance();
+		try (Harness harness = new Harness(false); var connection = harness.sender.getConnection()) {
+			var strategy = new DefaultEvaluationStrategy(new RepositoryTripleSource(connection), null,
+					ignored -> harness.endpoint);
+			TupleExpr fresh = strategy.optimizeForEmptyInput(expression, statistics, empty);
+			try (var rows = strategy.precompile(fresh).evaluate(empty)) {
+				assertThat(QueryResults.asList(rows)).extracting(row -> row.getValue("result"))
+						.containsExactly(VF.createLiteral("vNv"));
+			}
+			TupleExpr prepared = strategy.optimizeForEmptyInput(expression, statistics, parameters);
+			try (var rows = strategy.precompile(prepared).evaluate(empty)) {
+				assertThat(QueryResults.asList(rows)).extracting(row -> row.getValue("result"))
+						.containsExactly(VF.createLiteral("vYv"));
+			}
+			assertThatThrownBy(() -> strategy.optimizeForEmptyInput(prepared, statistics, empty))
+					.as("recapture of the prepared SERVICE inside the separator")
+					.isInstanceOf(QueryEvaluationException.class)
+					.hasMessageContaining("SERVICE");
+		}
+	}
 
 	@Test
 	void preparedTripleTermComponentsKeepTheirBindingsThroughTheRealProvider() throws Exception {

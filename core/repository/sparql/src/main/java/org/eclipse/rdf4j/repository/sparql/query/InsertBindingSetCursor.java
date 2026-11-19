@@ -14,7 +14,6 @@ package org.eclipse.rdf4j.repository.sparql.query;
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.common.iteration.FilterIteration;
 import org.eclipse.rdf4j.common.iteration.IterationWrapper;
-import org.eclipse.rdf4j.query.Binding;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
 import org.eclipse.rdf4j.query.QueryResults;
@@ -50,16 +49,7 @@ public class InsertBindingSetCursor extends IterationWrapper<BindingSet> {
 		if (next == null) {
 			return null;
 		}
-		int size = bindings.size() + next.size();
-		SPARQLQueryBindingSet set = new SPARQLQueryBindingSet(size);
-		set.addAll(bindings);
-		for (Binding binding : next) {
-			if (binding.getValue() != null && !set.hasBinding(binding.getName())) {
-				set.addBinding(binding);
-			}
-		}
-		return BindingSetSnapshots.preserveMetadata(bindings,
-				BindingSetSnapshots.preserveMetadata(next, set));
+		return BindingSetSnapshots.mergeWithPrecedence(bindings, next);
 	}
 
 }

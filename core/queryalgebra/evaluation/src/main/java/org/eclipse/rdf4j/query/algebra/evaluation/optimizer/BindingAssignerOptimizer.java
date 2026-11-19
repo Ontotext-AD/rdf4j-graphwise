@@ -36,6 +36,7 @@ public class BindingAssignerOptimizer implements QueryOptimizer {
 			}
 		} else if (context.mode() == BindingOptimizationContext.Mode.RUNTIME) {
 			plan(expression, context.evaluationInput(), Mode.RUNTIME_INPUT).apply();
+			PreparedQueryBindingPlan.recordRuntimeOptimization(expression);
 		}
 	}
 
@@ -50,8 +51,8 @@ public class BindingAssignerOptimizer implements QueryOptimizer {
 	/** Discovers captures and any legacy scope before a Sail or federation commits to either execution contract. */
 	@InternalUseOnly
 	public static PreparedQueryBindingPlan planForSail(TupleExpr expression, BindingSet parameters) {
-		return plan(expression, parameters,
-				parameters == null || parameters.isEmpty() ? Mode.EMPTY_INPUT : Mode.SAIL_COMPATIBILITY);
+		// An ordinary evaluation without new parameters has nothing to capture, including on an optimized tree.
+		return plan(expression, parameters, Mode.SAIL_COMPATIBILITY);
 	}
 
 	/**

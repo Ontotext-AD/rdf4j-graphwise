@@ -1413,6 +1413,9 @@ public class QueryEvaluationUtility {
 
 	private static final class PinnedFunctionCall extends FunctionCall implements BindingAnalysisContract.Standard {
 
+		// Preserve the computed UID from before the binding analysis contract was added.
+		private static final long serialVersionUID = 5694538062111370792L;
+
 		private transient volatile Function function;
 		private final Class<?> functionClass;
 

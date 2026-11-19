@@ -17,6 +17,7 @@ import java.util.Set;
 import org.eclipse.rdf4j.common.annotation.InternalUseOnly;
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.Value;
+import org.eclipse.rdf4j.query.Binding;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.QueryEvaluationException;
 import org.eclipse.rdf4j.query.algebra.BindingSetAssignment;
@@ -36,6 +37,7 @@ import org.eclipse.rdf4j.query.algebra.helpers.QueryAlgebraBindingAnalysis;
 import org.eclipse.rdf4j.query.algebra.helpers.TupleExprs;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
 import org.eclipse.rdf4j.query.impl.RemoteBNode;
+import org.eclipse.rdf4j.query.impl.SimpleBinding;
 
 /** Shared identity checks at scalar, batched, and directly invoked SERVICE transports. */
 @InternalUseOnly
@@ -76,7 +78,13 @@ public final class FederatedServiceIdentity {
 			QueryAlgebraBindingAnalysis analysis) {
 		MapBindingSet additional = new MapBindingSet();
 		Var endpoint = service.getServiceRef();
-		if (isRuntimeAssigned(endpoint, service) && !originals.hasBinding(endpoint.getName())) {
+		Binding publicEndpoint = publicEndpointInput(service);
+		if (publicEndpoint != null) {
+			if (!originals.hasBinding(publicEndpoint.getName())) {
+				additional.addBinding(publicEndpoint);
+			}
+		} else if (service.getRuntimeEndpointBindings().isEmpty() && isRuntimeAssigned(endpoint, service)
+				&& !originals.hasBinding(endpoint.getName())) {
 			additional.addBinding(endpoint.getName(), endpoint.getValue());
 		}
 		QueryAlgebraBindingAnalysis.OutputFacts outputs = analysis.outputFacts(service.getServiceExpr());
@@ -122,6 +130,24 @@ public final class FederatedServiceIdentity {
 			}
 		});
 		return additional;
+	}
+
+	/** The public caller input retained by endpoint specialization, or null for a fixed or unresolved selector. */
+	public static Binding publicEndpointInput(Service service) {
+		Var selector = service.getServiceRef();
+		var history = service.getRuntimeEndpointBindings();
+		if (!history.isEmpty()) {
+			// The optimizer may give the executable selector its own private name.
+			var input = history.entrySet().iterator().next();
+			return input.getValue().equals(selector.getValue())
+					? new SimpleBinding(input.getKey(), input.getValue())
+					: null;
+		}
+		// The same parameter may also be consumed by the saved body. Endpoint selection independently reads the
+		// public caller mapping, even when that other occurrence was specialized in the request.
+		return selector.hasApiInputOrigin() && selector.getName() != null
+				? new SimpleBinding(selector.getName(), selector.getValue())
+				: null;
 	}
 
 	private static Set<String> locallyProducedNames(Service service, QueryAlgebraBindingAnalysis analysis) {
