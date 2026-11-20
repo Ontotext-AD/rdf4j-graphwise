@@ -2396,27 +2396,27 @@ public class TupleExprBuilder extends AbstractASTVisitor {
 
 	@Override
 	public LangDir visit(ASTLangDirFunc node, Object data) throws VisitorException {
-		ValueExpr arg = mapValueExprToVar(node.jjtGetChild(0).jjtAccept(this, null));
+		ValueExpr arg = castToValueExpr(node.jjtGetChild(0).jjtAccept(this, null));
 		return new LangDir(arg);
 	}
 
 	@Override
 	public StrLangDir visit(ASTStrLangDirFunc node, Object data) throws VisitorException {
-		ValueExpr lexicalFormArg = mapValueExprToVar(node.jjtGetChild(0).jjtAccept(this, null));
-		ValueExpr langArg = mapValueExprToVar(node.jjtGetChild(1).jjtAccept(this, null));
-		ValueExpr dirArg = mapValueExprToVar(node.jjtGetChild(2).jjtAccept(this, null));
+		ValueExpr lexicalFormArg = castToValueExpr(node.jjtGetChild(0).jjtAccept(this, null));
+		ValueExpr langArg = castToValueExpr(node.jjtGetChild(1).jjtAccept(this, null));
+		ValueExpr dirArg = castToValueExpr(node.jjtGetChild(2).jjtAccept(this, null));
 		return new StrLangDir(lexicalFormArg, langArg, dirArg);
 	}
 
 	@Override
 	public HasLang visit(ASTHasLangFunc node, Object data) throws VisitorException {
-		ValueExpr arg = mapValueExprToVar(node.jjtGetChild(0).jjtAccept(this, null));
+		ValueExpr arg = castToValueExpr(node.jjtGetChild(0).jjtAccept(this, null));
 		return new HasLang(arg);
 	}
 
 	@Override
 	public HasLangDir visit(ASTHasLangDirFunc node, Object data) throws VisitorException {
-		ValueExpr arg = mapValueExprToVar(node.jjtGetChild(0).jjtAccept(this, null));
+		ValueExpr arg = castToValueExpr(node.jjtGetChild(0).jjtAccept(this, null));
 		return new HasLangDir(arg);
 	}
 
